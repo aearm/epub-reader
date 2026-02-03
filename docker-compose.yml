@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  epub-reader:
+    build: .
+    ports:
+      - "5001:5001"
+    volumes:
+      # Persist user data between restarts
+      - ./data/uploads:/app/static/uploads
+      - ./data/audio:/app/static/audio
+      - ./data/state:/app/static/state
+      - ./data/library:/app/static/library
+    environment:
+      - FLASK_ENV=production
+    restart: unless-stopped
