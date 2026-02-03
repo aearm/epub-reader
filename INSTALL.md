@@ -1,45 +1,81 @@
-# EPUB Reader - Installation Guide
+# 📚 EPUB Reader
 
-## One-Time Setup (5 minutes)
-
-### Step 1: Install Docker Desktop
-
-1. Download Docker Desktop: https://www.docker.com/products/docker-desktop/
-2. Open the downloaded file and drag Docker to Applications
-3. Open Docker Desktop from Applications
-4. Wait for it to start (you'll see a whale icon in your menu bar)
-
-That's it! Docker only needs to be installed once.
+### Read any book with AI-powered voice narration
 
 ---
 
-## Using the Reader
+## 🚀 Getting Started
 
-### To Start
-1. Make sure Docker Desktop is running (whale icon in menu bar)
-2. Double-click **"Start Reader.command"**
-3. Wait for browser to open (first time takes 2-3 minutes)
+### First Time Only (5 minutes)
 
-### To Stop
-- Double-click **"Stop Reader.command"**
-- Or just quit Docker Desktop
+**Download Docker Desktop:**
 
----
+👉 [Click here to download](https://www.docker.com/products/docker-desktop/)
 
-## Troubleshooting
+Then:
+1. Open the downloaded file
+2. Drag the Docker icon to your Applications folder
+3. Open Docker from Applications
+4. Wait until you see a **whale icon** 🐳 in your menu bar
 
-### "Docker is not running"
-→ Open Docker Desktop from Applications and wait for it to start
-
-### Browser shows "can't connect"
-→ Wait a minute and refresh - the server is still starting
-
-### First time is slow
-→ Normal! It's downloading the AI voice model (~500MB). Only happens once.
+✅ **Done! You only need to do this once.**
 
 ---
 
-## Your Data
+## 📖 How to Use
 
-All your books, audio, and reading progress are saved in the `data/` folder.
-To backup: copy the `data/` folder somewhere safe.
+### ▶️ Start Reading
+
+1. Look for the **whale icon** 🐳 in your menu bar (top of screen)
+   - If you don't see it, open Docker Desktop from Applications
+
+2. Double-click **`Start Reader`**
+
+3. Your browser will open automatically
+
+4. Upload any `.epub` book and enjoy!
+
+---
+
+### ⏹️ Stop Reading
+
+Double-click **`Stop Reader`**
+
+That's it!
+
+---
+
+## ✨ Features
+
+| | Feature |
+|---|---------|
+| 🎧 | **AI Voice** - Listen to any book read aloud |
+| 🌍 | **Translation** - Hover over words to translate |
+| 🎯 | **Focus Mode** - One sentence at a time |
+| 📚 | **Library** - Your books saved automatically |
+| 🌙 | **Dark Mode** - Easy on the eyes |
+| 🔥 | **Streaks** - Track your reading habits |
+
+---
+
+## ❓ Help
+
+| Problem | Solution |
+|---------|----------|
+| "Docker is not running" | Open Docker Desktop and wait for the whale 🐳 |
+| Browser won't open | Go to **localhost:5001** manually |
+| Very slow first time | Normal! Downloading voice (only once) |
+
+---
+
+## 💾 Your Data
+
+All your books and progress are saved in the **`data`** folder.
+
+**To backup:** Copy the `data` folder to a safe place.
+
+---
+
+<p align="center">
+  <i>Made with ❤️ for book lovers</i>
+</p>
