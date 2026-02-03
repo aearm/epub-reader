@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>EPUB Reader with TTS</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+    <div id="app">
+        <!-- Header with Controls -->
+        <header>
+            <div class="header-content">
+                <h1>EPUB Reader</h1>
+                <div class="controls">
+                    <input type="file" id="fileInput" accept=".epub" style="display: none;">
+                    <button id="uploadBtn" class="btn btn-primary">Upload EPUB</button>
+                    <button id="clearBtn" class="btn btn-secondary" style="display: none;">Clear Book</button>
+                </div>
+            </div>
+        </header>
+
+        <!-- Loading Indicator -->
+        <div id="loadingOverlay" class="loading-overlay" style="display: none;">
+            <div class="loading-content">
+                <div class="spinner"></div>
+                <p id="loadingText">Processing EPUB...</p>
+                <div class="progress-bar">
+                    <div id="progressFill" class="progress-fill"></div>
+                </div>
+                <p id="progressText"></p>
+            </div>
+        </div>
+
+        <!-- Main Content Area -->
+        <main>
+            <div id="welcomeScreen" class="welcome-screen">
+                <h2>Welcome to EPUB Reader</h2>
+                <p>Upload an EPUB file to get started</p>
+                <p>Features:</p>
+                <ul>
+                    <li>Click any sentence to hear it read aloud</li>
+                    <li>Auto-play mode for continuous reading</li>
+                    <li>Playback controls with speed adjustment</li>
+                    <li>Sentence highlighting during playback</li>
+                </ul>
+            </div>
+
+            <div id="readerContainer" class="reader-container" style="display: none;">
+                <!-- Sidebar for Chapters -->
+                <aside class="sidebar">
+                    <h3>Chapters</h3>
+                    <ul id="chapterList" class="chapter-list"></ul>
+                </aside>
+
+                <!-- Book Content -->
+                <div class="book-content">
+                    <div id="bookTitle" class="book-title"></div>
+                    <div id="chapterContent" class="chapter-content"></div>
+                </div>
+            </div>
+        </main>
+
+        <!-- Audio Player Controls -->
+        <footer id="audioControls" class="audio-controls" style="display: none;">
+            <div class="player-container">
+                <button id="playPauseBtn" class="control-btn">
+                    <span class="icon-play">▶</span>
+                    <span class="icon-pause" style="display: none;">⏸</span>
+                </button>
+                <button id="stopBtn" class="control-btn">⏹</button>
+                <button id="prevBtn" class="control-btn">⏮</button>
+                <button id="nextBtn" class="control-btn">⏭</button>
+
+                <div class="speed-control">
+                    <label for="speedSlider">Speed:</label>
+                    <input type="range" id="speedSlider" min="0.5" max="2" step="0.1" value="1">
+                    <span id="speedValue">1.0x</span>
+                </div>
+
+                <div class="autoplay-control">
+                    <input type="checkbox" id="autoplayCheckbox">
+                    <label for="autoplayCheckbox">Auto-play</label>
+                </div>
+
+                <div class="current-sentence">
+                    <span id="currentSentenceText"></span>
+                </div>
+            </div>
+        </footer>
+    </div>
+
+    <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>

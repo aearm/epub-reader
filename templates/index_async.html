@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>EPUB Reader</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style_async.css') }}">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Crimson+Pro:ital,wght@0,400;0,500;0,600;1,400;1,500&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div id="app">
+        <!-- Minimal Header -->
+        <header>
+            <div class="header-content">
+                <div class="header-left">
+                    <button id="toggleChapters" class="icon-btn" title="Chapters">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M3 12h18M3 6h18M3 18h18"/>
+                        </svg>
+                    </button>
+                    <button id="toggleNotes" class="icon-btn" title="My Notes">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                            <polyline points="14 2 14 8 20 8"/>
+                            <line x1="16" y1="13" x2="8" y2="13"/>
+                            <line x1="16" y1="17" x2="8" y2="17"/>
+                            <polyline points="10 9 9 9 8 9"/>
+                        </svg>
+                    </button>
+                    <h1 id="headerTitle">EPUB Reader</h1>
+                </div>
+                <div class="header-center">
+                    <input type="file" id="fileInput" accept=".epub" style="display: none;">
+                    <button id="uploadBtn" class="icon-btn" title="Open Book">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                            <polyline points="14 2 14 8 20 8"/>
+                            <line x1="12" y1="18" x2="12" y2="12"/>
+                            <line x1="9" y1="15" x2="15" y2="15"/>
+                        </svg>
+                    </button>
+                    <button id="clearBtn" class="icon-btn" title="Close Book" style="display: none;">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <line x1="18" y1="6" x2="6" y2="18"/>
+                            <line x1="6" y1="6" x2="18" y2="18"/>
+                        </svg>
+                    </button>
+                </div>
+                <div class="header-right">
+                    <button id="toggleFocus" class="icon-btn" title="Focus Mode">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <circle cx="12" cy="12" r="10"/>
+                            <circle cx="12" cy="12" r="3"/>
+                        </svg>
+                    </button>
+                    <button id="toggleSettings" class="icon-btn" title="Settings">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <circle cx="12" cy="12" r="3"/>
+                            <path d="M12 1v4M12 19v4M4.22 4.22l2.83 2.83M16.95 16.95l2.83 2.83M1 12h4M19 12h4M4.22 19.78l2.83-2.83M16.95 7.05l2.83-2.83"/>
+                        </svg>
+                    </button>
+                    <button id="toggleChat" class="icon-btn" title="Toggle AI Chat">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M12 2l2.4 7.4H22l-6 4.6 2.3 7L12 16.4 5.7 21l2.3-7L2 9.4h7.6L12 2z"/>
+                        </svg>
+                    </button>
+                </div>
+            </div>
+        </header>
+
+        <!-- Loading Indicator -->
+        <div id="loadingOverlay" class="loading-overlay" style="display: none;">
+            <div class="loading-content">
+                <div class="spinner"></div>
+                <p id="loadingText">Loading...</p>
+            </div>
+        </div>
+
+        <!-- Main Content Area -->
+        <main>
+            <!-- Welcome Screen -->
+            <div id="welcomeScreen" class="welcome-screen">
+                <div class="welcome-content">
+                    <div class="welcome-icon">📚</div>
+                    <h2>Ready to Read?</h2>
+                    <p class="welcome-subtitle">Start with just 5 minutes. You've got this.</p>
+
+                    <!-- Language Selection -->
+                    <div class="language-selector">
+                        <label for="motherTongue">Translate words to:</label>
+                        <select id="motherTongue">
+                            <option value="">Select your language</option>
+                            <option value="es">Spanish</option>
+                            <option value="fr">French</option>
+                            <option value="de">German</option>
+                            <option value="it">Italian</option>
+                            <option value="pt">Portuguese</option>
+                            <option value="ru">Russian</option>
+                            <option value="zh-CN">Chinese (Simplified)</option>
+                            <option value="ja">Japanese</option>
+                            <option value="ko">Korean</option>
+                            <option value="ar">Arabic</option>
+                            <option value="hi">Hindi</option>
+                            <option value="tr">Turkish</option>
+                            <option value="pl">Polish</option>
+                            <option value="nl">Dutch</option>
+                            <option value="sv">Swedish</option>
+                            <option value="el">Greek</option>
+                            <option value="he">Hebrew</option>
+                            <option value="th">Thai</option>
+                            <option value="vi">Vietnamese</option>
+                            <option value="fa">Persian</option>
+                            <option value="uk">Ukrainian</option>
+                            <option value="bn">Bengali</option>
+                            <option value="ta">Tamil</option>
+                            <option value="ur">Urdu</option>
+                        </select>
+                        <p class="language-hint">Hover over any word while reading to see translation</p>
+                    </div>
+
+                    <button class="btn btn-large btn-primary" onclick="document.getElementById('fileInput').click()">
+                        Open a Book
+                    </button>
+                    <div class="welcome-features">
+                        <div class="welcome-feature">
+                            <span class="feature-icon">🎯</span>
+                            <span>Focus Mode</span>
+                        </div>
+                        <div class="welcome-feature">
+                            <span class="feature-icon">🔊</span>
+                            <span>AI Audio</span>
+                        </div>
+                        <div class="welcome-feature">
+                            <span class="feature-icon">🔥</span>
+                            <span>Streaks</span>
+                        </div>
+                        <div class="welcome-feature">
+                            <span class="feature-icon">🌍</span>
+                            <span>Translation</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Library Section -->
+                <div id="librarySection" class="library-section" style="display: none;">
+                    <div class="library-header">
+                        <h3>Your Library</h3>
+                    </div>
+                    <div id="libraryGrid" class="library-grid">
+                        <!-- Book cards will be dynamically inserted here -->
+                    </div>
+                </div>
+            </div>
+
+            <!-- Reader Container -->
+            <div id="readerContainer" class="reader-container" style="display: none;">
+                <!-- Left Sidebar - Chapters/Notes -->
+                <aside id="leftSidebar" class="sidebar sidebar-left">
+                    <!-- Chapters View -->
+                    <div id="chaptersView" class="sidebar-view">
+                        <div class="sidebar-header">
+                            <h3>Chapters</h3>
+                            <span class="audio-badge"><span id="audioReady">0</span>/<span id="audioTotal">0</span></span>
+                        </div>
+                        <ul id="chapterList" class="chapter-list"></ul>
+                        <div class="sidebar-footer">
+                            <div class="audio-progress">
+                                <div class="progress-bar-mini">
+                                    <div id="audioProgressBar" class="progress-fill-mini"></div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <!-- Notes View -->
+                    <div id="notesView" class="sidebar-view" style="display: none;">
+                        <div class="sidebar-header">
+                            <h3>My Notes</h3>
+                            <span id="notesCount" class="audio-badge">0</span>
+                        </div>
+                        <div id="notesList" class="notes-list"></div>
+                        <div class="sidebar-footer">
+                            <button id="exportNotes" class="btn btn-secondary btn-small">Export Notes</button>
+                        </div>
+                    </div>
+                </aside>
+
+                <!-- Book Content -->
+                <div class="book-content">
+                    <div id="bookTitle" class="book-title"></div>
+                    <div id="chapterContent" class="chapter-content"></div>
+                </div>
+
+                <!-- Right Sidebar - AI Chat -->
+                <aside id="chatSidebar" class="sidebar sidebar-right hidden">
+                    <div class="sidebar-header">
+                        <h3>AI Assistant</h3>
+                        <button id="clearChat" class="icon-btn-small" title="Clear chat">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+                            </svg>
+                        </button>
+                    </div>
+                    <div id="chatMessages" class="chat-messages"></div>
+                    <div class="chat-input-container">
+                        <textarea id="chatInput" placeholder="Ask about the book..." rows="2"></textarea>
+                        <button id="sendChat" class="icon-btn-send" title="Send">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <line x1="22" y1="2" x2="11" y2="13"/>
+                                <polygon points="22 2 15 22 11 13 2 9 22 2"/>
+                            </svg>
+                        </button>
+                    </div>
+                    <div class="ollama-status">
+                        <span id="ollamaStatus" class="status-dot"></span>
+                        <span id="ollamaStatusText">Connecting to Ollama...</span>
+                    </div>
+                </aside>
+            </div>
+        </main>
+
+        <!-- Centered Audio Controls -->
+        <footer id="audioControls" class="audio-controls" style="display: none;">
+            <div class="player-container">
+                <button id="prevBtn" class="control-btn" title="Previous">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+                        <path d="M6 6h2v12H6zm3.5 6l8.5 6V6z"/>
+                    </svg>
+                </button>
+                <button id="playPauseBtn" class="control-btn control-btn-main" title="Play/Pause">
+                    <span class="icon-play">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
+                            <path d="M8 5v14l11-7z"/>
+                        </svg>
+                    </span>
+                    <span class="icon-pause" style="display: none;">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
+                            <path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/>
+                        </svg>
+                    </span>
+                </button>
+                <button id="nextBtn" class="control-btn" title="Next">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+                        <path d="M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z"/>
+                    </svg>
+                </button>
+                <button id="stopBtn" class="control-btn" title="Stop">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+                        <path d="M6 6h12v12H6z"/>
+                    </svg>
+                </button>
+
+                <div class="control-divider"></div>
+
+                <div class="speed-control">
+                    <input type="range" id="speedSlider" min="0.5" max="2" step="0.1" value="1">
+                    <span id="speedValue">1.0x</span>
+                </div>
+
+                <label class="autoplay-toggle">
+                    <input type="checkbox" id="autoplayCheckbox">
+                    <span>Auto</span>
+                </label>
+            </div>
+        </footer>
+
+        <!-- Context Menu -->
+        <div id="contextMenu" class="context-menu" style="display: none;">
+            <div class="context-menu-item" data-action="copy">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
+                    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+                </svg>
+                Copy
+            </div>
+            <div class="context-menu-item" data-action="addNote">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
+                    <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+                </svg>
+                Add Note
+            </div>
+            <div class="context-menu-item" data-action="askAI">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <circle cx="12" cy="12" r="10"/>
+                    <path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/>
+                    <line x1="12" y1="17" x2="12.01" y2="17"/>
+                </svg>
+                Ask AI
+            </div>
+            <div class="context-menu-item" data-action="playThis">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <polygon points="5 3 19 12 5 21 5 3"/>
+                </svg>
+                Play This
+            </div>
+        </div>
+
+        <!-- Translation Tooltip -->
+        <div id="translationTooltip" class="translation-tooltip" style="display: none;">
+            <div class="tooltip-original"></div>
+            <div class="tooltip-arrow">→</div>
+            <div class="tooltip-translation"></div>
+            <div class="tooltip-loading" style="display: none;">
+                <span class="tooltip-spinner"></span>
+            </div>
+        </div>
+
+        <!-- Focus Mode Overlay -->
+        <div id="focusMode" class="focus-mode" style="display: none;">
+            <div class="focus-header">
+                <button id="exitFocus" class="focus-exit-btn" title="Exit (Esc)">
+                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+                    </svg>
+                </button>
+                <div class="focus-progress">
+                    <div id="focusProgressBar" class="focus-progress-fill"></div>
+                </div>
+                <span id="focusProgressText" class="focus-progress-text">1 / 10</span>
+                <label class="focus-autoplay-toggle">
+                    <input type="checkbox" id="focusAutoplay">
+                    <span>Auto</span>
+                </label>
+            </div>
+            <div class="focus-content">
+                <p id="focusParagraph" class="focus-paragraph"></p>
+            </div>
+            <div class="focus-nav">
+                <button id="focusPrev" class="focus-nav-btn">↑ Prev</button>
+                <button id="focusPlay" class="focus-nav-btn focus-nav-play" title="Play (Space)">
+                    <svg id="focusPlayIcon" width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
+                        <path d="M8 5v14l11-7z"/>
+                    </svg>
+                    <svg id="focusPauseIcon" width="24" height="24" viewBox="0 0 24 24" fill="currentColor" style="display:none;">
+                        <path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/>
+                    </svg>
+                </button>
+                <button id="focusNext" class="focus-nav-btn focus-nav-primary">Next ↓</button>
+            </div>
+            <div class="focus-hint">
+                ↑↓ Sentence &nbsp;•&nbsp; ←→ Skip 5 &nbsp;•&nbsp; Space Play/Pause
+            </div>
+        </div>
+
+        <!-- Session Timer -->
+        <div id="sessionTimer" class="session-timer" style="display: none;">
+            <div class="session-timer-display">
+                <span id="sessionTimeLeft">5:00</span>
+            </div>
+            <div class="session-timer-label">Focus Session</div>
+        </div>
+
+        <!-- Settings Panel -->
+        <div id="settingsPanel" class="settings-panel" style="display: none;">
+            <div class="settings-header">
+                <h3>Settings</h3>
+                <button id="closeSettings" class="icon-btn-small">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+                    </svg>
+                </button>
+            </div>
+            <div class="settings-body">
+                <div class="setting-group">
+                    <label class="setting-label">Theme</label>
+                    <div class="theme-options">
+                        <button class="theme-btn active" data-theme="light">
+                            <span class="theme-preview theme-light"></span>
+                            Light
+                        </button>
+                        <button class="theme-btn" data-theme="sepia">
+                            <span class="theme-preview theme-sepia"></span>
+                            Sepia
+                        </button>
+                        <button class="theme-btn" data-theme="dark">
+                            <span class="theme-preview theme-dark"></span>
+                            Dark
+                        </button>
+                    </div>
+                </div>
+                <div class="setting-group">
+                    <label class="setting-label">Reading Aids</label>
+                    <label class="setting-toggle">
+                        <input type="checkbox" id="bionicToggle">
+                        <span class="toggle-slider"></span>
+                        Bionic Reading (bold word starts)
+                    </label>
+                </div>
+                <div class="setting-group">
+                    <label class="setting-label">Session Timer</label>
+                    <div class="session-options">
+                        <button class="session-btn" data-minutes="5">5 min</button>
+                        <button class="session-btn" data-minutes="10">10 min</button>
+                        <button class="session-btn" data-minutes="15">15 min</button>
+                        <button class="session-btn" data-minutes="25">25 min</button>
+                    </div>
+                </div>
+                <div class="setting-group">
+                    <label class="setting-label">Your Stats</label>
+                    <div class="stats-display">
+                        <div class="stat-item">
+                            <span class="stat-value" id="statStreak">0</span>
+                            <span class="stat-label">Day Streak 🔥</span>
+                        </div>
+                        <div class="stat-item">
+                            <span class="stat-value" id="statToday">0</span>
+                            <span class="stat-label">Min Today</span>
+                        </div>
+                        <div class="stat-item">
+                            <span class="stat-value" id="statTotal">0</span>
+                            <span class="stat-label">Pages Read</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Celebration Overlay -->
+        <div id="celebration" class="celebration" style="display: none;">
+            <div class="celebration-content">
+                <div class="celebration-emoji">🎉</div>
+                <div class="celebration-text">Great job!</div>
+                <div class="celebration-subtext"></div>
+            </div>
+        </div>
+
+        <!-- Note Modal -->
+        <div id="noteModal" class="modal" style="display: none;">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h3>Add Note</h3>
+                    <button class="modal-close" onclick="document.getElementById('noteModal').style.display='none'">&times;</button>
+                </div>
+                <div class="modal-body">
+                    <p id="noteSelectedText" class="note-selected-text"></p>
+                    <textarea id="noteInput" placeholder="Write your note..." rows="4"></textarea>
+                </div>
+                <div class="modal-footer">
+                    <button class="btn btn-secondary" onclick="document.getElementById('noteModal').style.display='none'">Cancel</button>
+                    <button id="saveNote" class="btn btn-primary">Save Note</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <script src="{{ url_for('static', filename='js/app_async.js') }}"></script>
+</body>
+</html>
