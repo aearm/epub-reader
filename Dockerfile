@@ -1,5 +1,5 @@
-# EPUB Reader with TTS
-FROM python:3.10-slim
+# EPUB Reader with local Kokoro worker
+FROM python:3.11-slim
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
@@ -17,14 +17,14 @@ COPY requirements.txt .
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Download TTS model at build time (so it's cached)
-RUN python -c "from TTS.api import TTS; TTS('tts_models/en/ljspeech/tacotron2-DDC')"
-
 # Copy application code
 COPY . .
 
 # Create directories for user data
-RUN mkdir -p static/uploads static/audio static/state static/library/covers
+RUN mkdir -p static/uploads static/audio static/state static/library/covers static/models
+
+# Prefer ONNX Kokoro backend for deterministic local worker behavior
+ENV KOKORO_BACKEND=onnx
 
 # Expose port
 EXPOSE 5001

@@ -216,31 +216,82 @@ class EPUBProcessorV2:
     # PASS 2: Extract & Segment Sentences
     # =========================================================================
 
-    def _segment_text(self, text: str) -> list:
+    def _normalize_with_index(self, text: str):
         """
-        Use PySBD for accurate sentence segmentation.
-        PySBD correctly handles:
-        - Abbreviations (Dr., Mr., Mrs., etc.)
-        - Decimal numbers (3.14)
-        - URLs and emails
-        - Ellipsis (...)
+        Collapse whitespace while preserving a mapping from normalized index
+        back to the original text index.
+        """
+        normalized_chars = []
+        norm_to_raw = []
+        previous_was_space = False
+
+        for raw_idx, char in enumerate(text):
+            if char.isspace():
+                if not previous_was_space:
+                    normalized_chars.append(' ')
+                    norm_to_raw.append(raw_idx)
+                    previous_was_space = True
+            else:
+                normalized_chars.append(char)
+                norm_to_raw.append(raw_idx)
+                previous_was_space = False
+
+        return ''.join(normalized_chars), norm_to_raw
+
+    def _segment_text_with_offsets(self, text: str) -> list:
+        """
+        Use PySBD for accurate sentence segmentation and return spans with
+        offsets mapped to the original raw text.
         """
         if not text or not text.strip():
             return []
 
-        # Clean up whitespace
-        text = ' '.join(text.split())
+        normalized_text, norm_to_raw = self._normalize_with_index(text)
+        if not normalized_text.strip():
+            return []
 
-        # Use PySBD to segment
-        sentences = self.segmenter.segment(text)
+        segments = self.segmenter.segment(normalized_text)
+        spans = []
+        cursor = 0
 
-        # Filter out empty or whitespace-only sentences
-        sentences = [s.strip() for s in sentences if s.strip()]
+        for segment in segments:
+            if not segment:
+                continue
 
-        # Filter out sentences that are too short or don't contain letters
-        sentences = [s for s in sentences if len(s) >= 3 and any(c.isalpha() for c in s)]
+            start = normalized_text.find(segment, cursor)
+            if start == -1:
+                start = normalized_text.find(segment)
+                if start == -1:
+                    continue
 
-        return sentences
+            end = start + len(segment)
+            cursor = end
+
+            # Trim leading/trailing whitespace from boundaries
+            trimmed_start = start
+            trimmed_end = end
+            while trimmed_start < trimmed_end and normalized_text[trimmed_start].isspace():
+                trimmed_start += 1
+            while trimmed_end > trimmed_start and normalized_text[trimmed_end - 1].isspace():
+                trimmed_end -= 1
+
+            if trimmed_start >= trimmed_end:
+                continue
+
+            raw_start = norm_to_raw[trimmed_start]
+            raw_end = norm_to_raw[trimmed_end - 1] + 1
+            sentence_text = ' '.join(text[raw_start:raw_end].split())
+
+            if len(sentence_text) < 3 or not any(c.isalpha() for c in sentence_text):
+                continue
+
+            spans.append({
+                'text': sentence_text,
+                'start': raw_start,
+                'end': raw_end
+            })
+
+        return spans
 
     def _process_chapter(self, item):
         """Process a single chapter through both passes."""
@@ -316,39 +367,9 @@ class EPUBProcessorV2:
                 continue
 
             # PASS 2: Use PySBD for sentence segmentation
-            sentences = self._segment_text(full_text)
-            if not sentences:
+            spans = self._segment_text_with_offsets(full_text)
+            if not spans:
                 continue
-
-            # Map sentences back to character positions
-            spans = []
-            search_start = 0
-            for sent in sentences:
-                # Find this sentence in the full text
-                idx = full_text.find(sent, search_start)
-                if idx == -1:
-                    # Try with normalized whitespace
-                    normalized_full = ' '.join(full_text[search_start:].split())
-                    normalized_sent = ' '.join(sent.split())
-                    idx = normalized_full.find(normalized_sent)
-                    if idx != -1:
-                        idx = search_start + idx
-
-                if idx != -1:
-                    spans.append({
-                        'text': sent,
-                        'start': idx,
-                        'end': idx + len(sent)
-                    })
-                    search_start = idx + len(sent)
-                else:
-                    # Fallback: just use the sentence without position
-                    spans.append({
-                        'text': sent,
-                        'start': search_start,
-                        'end': search_start + len(sent)
-                    })
-                    search_start += len(sent)
 
             # Generate IDs and collect sentences
             for s in spans:

@@ -1,8 +1,8 @@
 # utils/tts_generator_async.py
-from kokoro import KPipeline
 import soundfile as sf
 import os
 import threading
+from utils.kokoro_engine import KokoroEngine
 
 
 class AsyncTTSGenerator:
@@ -11,10 +11,10 @@ class AsyncTTSGenerator:
     Useful if you want a simple async generator without a pool.
     """
 
-    def __init__(self, lang_code='a', voice='af_heart'):
-        self.pipeline = KPipeline(lang_code=lang_code)
-        self.voice = voice
-        self.sample_rate = 24000
+    def __init__(self, lang_code='a', voice='af_sarah'):
+        self.engine = KokoroEngine(lang_code=lang_code, voice=voice)
+        self.voice = self.engine.voice
+        self.sample_rate = self.engine.sample_rate
         self.lock = threading.Lock()
 
     def generate_single_sentence(self, sentence_data, output_dir: str) -> bool:
@@ -55,9 +55,9 @@ class AsyncTTSGenerator:
     def _generate_audio(self, text: str):
         """Internal Kokoro generator call."""
         try:
-            generator = self.pipeline(text, voice=self.voice)
-            for i, (gs, ps, audio) in enumerate(generator):
-                return audio
+            audio = self.engine.generate_audio(text)
+            self.sample_rate = self.engine.sample_rate
+            return audio
         except Exception as e:
             print(f"Error in TTS generation: {e}")
             return None

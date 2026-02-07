@@ -1,0 +1,25 @@
+.git
+.gitignore
+.DS_Store
+.venv
+__pycache__
+*.pyc
+
+# Large local/runtime data
+data
+static/audio
+static/uploads
+static/state
+static/library
+static/models
+
+# Frontend/build artifacts not needed for worker image
+node_modules
+calm-reader/node_modules
+calm-reader/dist
+terraform
+
+# Logs and temporary files
+*.log
+*.tmp
+*.part

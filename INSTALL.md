@@ -76,6 +76,48 @@ All your books and progress are saved in the **`data`** folder.
 
 ---
 
+## ☁️ Optional: EC2 Coordinator + S3 Sync
+
+If you want local Kokoro generation to sync with EC2/S3, create a `.env` file next to `docker-compose.yml`:
+
+```bash
+KOKORO_BACKEND=onnx
+COORDINATOR_API_URL=https://api.reader.psybytes.com
+COORDINATOR_TIMEOUT=20
+COORDINATOR_IDLE_POLL_INTERVAL=2.0
+AUDIO_UPLOAD_FORMAT=m4b
+WORKER_BOOK_PARALLELISM=8
+WORKER_UPLOAD_URL_BATCH_SIZE=80
+WORKER_COMPLETE_BATCH_SIZE=50
+WORKER_MP3_BITRATE=64k
+WORKER_MP3_SAMPLE_RATE=24000
+```
+
+If user is logged in via Cognito in the web app, token is forwarded to local backend automatically.
+You only need `COORDINATOR_BEARER_TOKEN` when running without web-login token forwarding.
+
+`COORDINATOR_API_URL` defaults to `https://api.reader.psybytes.com`, so no env is required for standard setup.
+
+### Start Local Audio Worker
+
+```bash
+docker compose up -d --build
+```
+
+Check health:
+
+```bash
+curl http://127.0.0.1:5001/worker/health
+```
+
+Then use `https://reader.psybytes.com` while logged in.
+
+Under each book on homepage:
+- `Generate Audio`: runs local worker in parallel on your machine, uploads compressed MP3 to S3, and updates cloud progress.
+- `Load Audio Locally`: downloads ready cloud audio files into local cache for faster playback.
+
+---
+
 <p align="center">
   <i>Made with ❤️ for book lovers</i>
 </p>

@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   epub-reader:
     build: .
@@ -11,6 +9,19 @@ services:
       - ./data/audio:/app/static/audio
       - ./data/state:/app/static/state
       - ./data/library:/app/static/library
+      - ./data/models:/app/static/models
     environment:
       - FLASK_ENV=production
+      - COORDINATOR_API_URL=${COORDINATOR_API_URL:-https://api.reader.psybytes.com}
+      - COORDINATOR_BEARER_TOKEN=${COORDINATOR_BEARER_TOKEN:-}
+      - COORDINATOR_TIMEOUT=${COORDINATOR_TIMEOUT:-20}
+      - COORDINATOR_IDLE_POLL_INTERVAL=${COORDINATOR_IDLE_POLL_INTERVAL:-2.0}
+      - AUDIO_UPLOAD_FORMAT=${AUDIO_UPLOAD_FORMAT:-m4b}
+      - WORKER_TTS_POOL_SIZE=${WORKER_TTS_POOL_SIZE:-32}
+      - WORKER_TTS_HARD_CAP=${WORKER_TTS_HARD_CAP:-12}
+      - WORKER_BOOK_PARALLELISM=${WORKER_BOOK_PARALLELISM:-32}
+      - WORKER_UPLOAD_URL_BATCH_SIZE=${WORKER_UPLOAD_URL_BATCH_SIZE:-80}
+      - WORKER_COMPLETE_BATCH_SIZE=${WORKER_COMPLETE_BATCH_SIZE:-50}
+      - WORKER_MP3_BITRATE=${WORKER_MP3_BITRATE:-64k}
+      - WORKER_MP3_SAMPLE_RATE=${WORKER_MP3_SAMPLE_RATE:-24000}
     restart: unless-stopped

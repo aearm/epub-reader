@@ -1,8 +1,7 @@
 # utils/tts_generator.py
-from kokoro import KPipeline
 import soundfile as sf
 import os
-from utils.text_normalizer import normalize_text
+from utils.kokoro_engine import KokoroEngine
 
 
 class TTSGenerator:
@@ -13,10 +12,10 @@ class TTSGenerator:
     - generate_audio_stream: generator yielding chunks for streaming.
     """
 
-    def __init__(self, lang_code='a', voice='af_heart'):
-        self.pipeline = KPipeline(lang_code=lang_code)
-        self.voice = voice
-        self.sample_rate = 24000
+    def __init__(self, lang_code='a', voice='af_sarah'):
+        self.engine = KokoroEngine(lang_code=lang_code, voice=voice)
+        self.voice = self.engine.voice
+        self.sample_rate = self.engine.sample_rate
 
     # -------------------------------------------------------------------------
     # Batch generation
@@ -62,11 +61,9 @@ class TTSGenerator:
     def _generate_single_audio(self, text: str):
         """Generate audio for a single sentence."""
         try:
-            # Normalize text for better TTS pronunciation
-            normalized_text = normalize_text(text)
-            generator = self.pipeline(normalized_text, voice=self.voice)
-            for i, (gs, ps, audio) in enumerate(generator):
-                return audio
+            audio = self.engine.generate_audio(text)
+            self.sample_rate = self.engine.sample_rate
+            return audio
         except Exception as e:
             print(f"Error in TTS generation: {e}")
             return None
@@ -77,10 +74,9 @@ class TTSGenerator:
     def generate_audio_stream(self, text: str):
         """Yield audio chunks for streaming playback."""
         try:
-            # Normalize text for better TTS pronunciation
-            normalized_text = normalize_text(text)
-            generator = self.pipeline(normalized_text, voice=self.voice)
-            for i, (gs, ps, audio) in enumerate(generator):
+            audio = self.engine.generate_audio(text)
+            if audio is not None:
+                self.sample_rate = self.engine.sample_rate
                 yield audio
         except Exception as e:
             print(f"Error in TTS stream generation: {e}")

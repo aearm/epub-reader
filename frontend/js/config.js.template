@@ -1,0 +1,27 @@
+/**
+ * EPUB Reader Configuration
+ * Auto-generated from Terraform outputs
+ */
+
+window.EPUB_READER_CONFIG = {
+    // API Configuration
+    apiUrl: '${API_URL}',
+    localWorkerUrl: 'http://127.0.0.1:5001',
+
+    // Cognito Configuration
+    cognito: {
+        userPoolId: '${COGNITO_USER_POOL_ID}',
+        clientId: '${COGNITO_CLIENT_ID}',
+        domain: '${COGNITO_DOMAIN}',
+        region: '${AWS_REGION}'
+    },
+
+    // S3 Audio Bucket
+    audioBucketUrl: '${AUDIO_BUCKET_URL}',
+
+    // Feature Flags
+    features: {
+        volunteerMode: true,  // Allow users to generate audio
+        offlineSupport: true  // Cache audio locally
+    }
+};

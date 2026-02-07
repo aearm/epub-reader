@@ -22,6 +22,14 @@ static/uploads/
 static/audio/
 static/state/
 static/library/
+static/models/
+data/audio/
+data/models/
+data/state/
+terraform/.terraform/
+terraform/tfplan
+terraform/*.tfstate
+terraform/*.tfstate.*
 
 # Environment
 .env

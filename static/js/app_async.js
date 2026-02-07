@@ -47,13 +47,61 @@ class ProgressiveEPUBReader {
         this.sessionTimeLeft = 0;
         this.sessionInterval = null;
         this.stats = this.loadStats();
+        this.cognitoAccessToken = this.getStoredAccessToken();
 
         this.initializeElements();
         this.attachEventListeners();
         this.initializeWebSocket();
         this.initializeOllama();
+        this.syncCoordinatorToken();
         this.startPositionTracking();
         this.loadLibrary();
+    }
+
+    getStoredAccessToken() {
+        const fromSimpleStorage = (
+            localStorage.getItem('epub_cognito_access_token') ||
+            sessionStorage.getItem('epub_cognito_access_token')
+        );
+        if (fromSimpleStorage) return fromSimpleStorage;
+
+        // Compatible with AuthClient storage format used in cloud app.
+        const authSessionRaw = localStorage.getItem('epub_reader_auth');
+        if (authSessionRaw) {
+            try {
+                const parsed = JSON.parse(authSessionRaw);
+                if (parsed && parsed.accessToken) return parsed.accessToken;
+            } catch (error) {
+                console.warn('Invalid epub_reader_auth session data:', error);
+            }
+        }
+
+        return (
+            null
+        );
+    }
+
+    getAuthHeaders(contentType = null) {
+        const token = this.getStoredAccessToken();
+        const headers = {};
+        if (contentType) headers['Content-Type'] = contentType;
+        if (token) headers['Authorization'] = `Bearer ${token}`;
+        return headers;
+    }
+
+    async syncCoordinatorToken() {
+        const token = this.getStoredAccessToken();
+        if (!token) return;
+
+        try {
+            await fetch('/coordinator/token', {
+                method: 'POST',
+                headers: this.getAuthHeaders('application/json'),
+                body: JSON.stringify({ access_token: token })
+            });
+        } catch (error) {
+            console.warn('Failed to sync coordinator token:', error);
+        }
     }
 
     initializeElements() {
@@ -1069,6 +1117,7 @@ class ProgressiveEPUBReader {
         try {
             const response = await fetch('/upload', {
                 method: 'POST',
+                headers: this.getAuthHeaders(),
                 body: formData
             });
 
@@ -1529,11 +1578,35 @@ class ProgressiveEPUBReader {
     }
 
     getCurrentPosition() {
+        // Prefer the actively playing sentence, otherwise anchor to the top visible sentence.
+        const anchorSentenceId = this.currentSentence?.id || this.getTopVisibleSentenceId();
+        const anchorSentence = anchorSentenceId
+            ? this.sentences.find(s => s.id === anchorSentenceId)
+            : null;
+
         return {
             chapter_index: this.currentChapter,
-            sentence_id: this.currentSentence?.id || null,
-            sentence_index: this.currentSentence?.sentence_index || 0
+            sentence_id: anchorSentenceId || null,
+            sentence_index: anchorSentence?.sentence_index || 0,
+            scroll_y: window.scrollY || document.documentElement.scrollTop || 0
         };
+    }
+
+    getTopVisibleSentenceId() {
+        if (!this.chapterContent) return null;
+
+        const spans = Array.from(this.chapterContent.querySelectorAll('.sentence'));
+        if (spans.length === 0) return null;
+
+        const viewportTop = 0;
+        for (const span of spans) {
+            const rect = span.getBoundingClientRect();
+            if (rect.bottom >= viewportTop + 40) {
+                return span.dataset.sentenceId || null;
+            }
+        }
+
+        return spans[0]?.dataset.sentenceId || null;
     }
 
     async savePosition() {
@@ -1544,7 +1617,7 @@ class ProgressiveEPUBReader {
         try {
             await fetch('/position/save', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: this.getAuthHeaders('application/json'),
                 body: JSON.stringify({
                     book_id: this.currentBook.book_id,
                     position: position
@@ -1576,7 +1649,9 @@ class ProgressiveEPUBReader {
         if (!this.currentBook) return null;
 
         try {
-            const response = await fetch(`/position/load/${this.currentBook.book_id}`);
+            const response = await fetch(`/position/load/${this.currentBook.book_id}`, {
+                headers: this.getAuthHeaders()
+            });
             const data = await response.json();
             if (data.success && data.position) return data.position;
         } catch (error) {
@@ -1600,8 +1675,14 @@ class ProgressiveEPUBReader {
                         el.scrollIntoView({ behavior: 'smooth', block: 'center' });
                         el.classList.add('playing');
                         setTimeout(() => el.classList.remove('playing'), 2000);
+                    } else if (typeof position.scroll_y === 'number') {
+                        window.scrollTo({ top: position.scroll_y, behavior: 'smooth' });
                     }
                 }, 500);
+            } else if (typeof position.scroll_y === 'number') {
+                setTimeout(() => {
+                    window.scrollTo({ top: position.scroll_y, behavior: 'smooth' });
+                }, 300);
             }
         } else if (this.currentBook.chapters.length > 0) {
             this.displayChapter(0);
@@ -1657,7 +1738,7 @@ class ProgressiveEPUBReader {
         try {
             await fetch('/update_position', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: this.getAuthHeaders('application/json'),
                 body: JSON.stringify({
                     chapter_index: this.currentChapter,
                     page_sentences: pageSentenceIds
@@ -1676,7 +1757,7 @@ class ProgressiveEPUBReader {
         try {
             await fetch('/prioritize', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: this.getAuthHeaders('application/json'),
                 body: JSON.stringify({ sentence_ids: sentenceIds })
             });
         } catch (error) {
@@ -1690,7 +1771,7 @@ class ProgressiveEPUBReader {
         try {
             await fetch('/start_generation', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: this.getAuthHeaders('application/json'),
                 body: JSON.stringify({ book_id: this.currentBook.book_id })
             });
         } catch (error) {
@@ -2368,7 +2449,10 @@ class ProgressiveEPUBReader {
 
         try {
             // Load book from server (will re-process if needed)
-            const response = await fetch(`/load_book/${bookId}`, { method: 'POST' });
+            const response = await fetch(`/load_book/${bookId}`, {
+                method: 'POST',
+                headers: this.getAuthHeaders()
+            });
             const data = await response.json();
 
             if (data.success) {
@@ -2390,7 +2474,7 @@ class ProgressiveEPUBReader {
         try {
             await fetch('/library/update_progress', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: this.getAuthHeaders('application/json'),
                 body: JSON.stringify({
                     book_id: this.currentBook.book_id,
                     chapter_index: this.currentChapter,

@@ -1,12 +1,11 @@
 # utils/tts_generator_pool.py
-
-from kokoro import KPipeline
 import soundfile as sf
 import os
 import torch
 import threading
 from queue import Queue
 from utils.text_normalizer import normalize_text
+from utils.kokoro_engine import KokoroEngine
 
 
 class TTSInstance:
@@ -15,10 +14,10 @@ class TTSInstance:
     This uses the SAME pipeline that works in your Jupyter test.
     """
 
-    def __init__(self, instance_id, lang_code='a', voice='af_heart'):
+    def __init__(self, instance_id, lang_code='a', voice='af_sarah'):
         self.instance_id = instance_id
-        self.pipeline = KPipeline(lang_code=lang_code)
-        self.voice = voice
+        self.engine = KokoroEngine(lang_code=lang_code, voice=voice)
+        self.voice = self.engine.voice
         self.sample_rate = 24000
         self.in_use = False
 
@@ -29,9 +28,9 @@ class TTSInstance:
         """Generate audio using a KPipeline instance (thread-safe)."""
         try:
             with self.lock:
-                generator = self.pipeline(text, voice=self.voice)
-                for i, (gs, ps, audio) in enumerate(generator):
-                    return audio
+                audio = self.engine.generate_audio(text)
+                self.sample_rate = self.engine.sample_rate
+                return audio
 
         except Exception as e:
             print(f"[TTSInstance {self.instance_id}] Error: {e}")
@@ -44,7 +43,7 @@ class TTSPool:
     Uses *multiple* pipelines, one per thread.
     """
 
-    def __init__(self, pool_size=None, lang_code='a', voice='af_heart'):
+    def __init__(self, pool_size=None, lang_code='a', voice='af_sarah'):
         # Auto-detect pool size (similar logic to your ONNX version)
         if pool_size is None:
             if torch.cuda.is_available():

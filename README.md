@@ -49,6 +49,52 @@ http://localhost:5000
    - Navigate chapters using the sidebar
    - Adjust playback speed as needed
 
+## Distributed Coordinator Mode (EC2 + S3)
+
+The local desktop app (`app_multithreaded.py`) now supports this flow:
+
+1. Sentence parsing happens locally in Python (`EPUBProcessorV2` + PySBD).
+2. Kokoro audio is generated on the user machine.
+3. Generated files are uploaded to S3 through coordinator presigned URLs.
+4. The EC2 coordinator tracks sentence status and serves ready S3 URLs.
+5. Books and reading position remain cached locally (library + last position restore).
+
+Optional environment variables for local runtime:
+
+- `COORDINATOR_API_URL` (example: `https://api.reader.psybytes.com`)
+- `COORDINATOR_BEARER_TOKEN` (optional fallback; token can also be passed from logged-in web app at runtime)
+- `KOKORO_BACKEND` (`onnx` default, can be `pipeline`)
+- `KOKORO_MODEL_DIR` (default `static/models`)
+
+Coordinator SQS queue options (single queue mode):
+- `AUDIO_SQS_QUEUE_URL` (main queue URL; enables SQS pull path)
+- `AUDIO_SQS_DLQ_URL` (optional DLQ URL for poison messages)
+- `AUDIO_SQS_WAIT_SECONDS` (long-poll wait, default `2`)
+- `AUDIO_SQS_VISIBILITY_TIMEOUT` (seconds, default `180`)
+- `AUDIO_SQS_MAX_RECEIVE_COUNT` (max retries before fail/DLQ, default `8`)
+
+## Run Local Worker (Docker)
+
+Use this when reading from `https://reader.psybytes.com` and you want local Kokoro generation on your machine.
+
+1. Start Docker Desktop.
+2. Start worker:
+```bash
+docker compose up -d --build
+```
+3. Verify worker is reachable:
+```bash
+curl http://127.0.0.1:5001/worker/health
+```
+4. Open cloud web app, login with Cognito, and read.
+   - If sentence audio is missing in S3, web app asks local worker to generate and upload it.
+
+Optional overrides via `.env`:
+- `COORDINATOR_API_URL` (custom coordinator URL)
+- `COORDINATOR_TIMEOUT` (HTTP timeout to coordinator, default `20`)
+- `COORDINATOR_IDLE_POLL_INTERVAL` (idle queue poll interval in seconds, default `2.0`)
+- `KOKORO_BACKEND` (`onnx` default)
+
 ## How It Works
 
 1. **EPUB Processing**: When you upload an EPUB file, the system:
