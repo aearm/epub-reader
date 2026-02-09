@@ -11,7 +11,7 @@ class AuthClient {
     constructor(config) {
         this.userPoolId = config.userPoolId;
         this.clientId = config.clientId;
-        this.region = config.region || 'eu-west-1';
+        this.region = config.region || 'us-east-2';
         this.domain = config.domain;
         this.redirectUri = config.redirectUri || window.location.origin;
 

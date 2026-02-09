@@ -10,10 +10,19 @@ services:
       - ./data/state:/app/static/state
       - ./data/library:/app/static/library
       - ./data/models:/app/static/models
+      - ${HOME}/.aws:/root/.aws:ro
     environment:
       - FLASK_ENV=production
       - COORDINATOR_API_URL=${COORDINATOR_API_URL:-https://api.reader.psybytes.com}
       - COORDINATOR_BEARER_TOKEN=${COORDINATOR_BEARER_TOKEN:-}
+      - AWS_REGION=${AWS_REGION:-us-east-2}
+      - AWS_PROFILE=${AWS_PROFILE:-}
+      - AWS_SDK_LOAD_CONFIG=${AWS_SDK_LOAD_CONFIG:-1}
+      - AUDIO_SQS_QUEUE_URL=${AUDIO_SQS_QUEUE_URL:-}
+      - AUDIO_SQS_WAIT_SECONDS=${AUDIO_SQS_WAIT_SECONDS:-10}
+      - AUDIO_SQS_MAX_MESSAGES=${AUDIO_SQS_MAX_MESSAGES:-10}
+      - AUDIO_SQS_VISIBILITY_TIMEOUT=${AUDIO_SQS_VISIBILITY_TIMEOUT:-180}
+      - WORKER_SQS_CONCURRENCY=${WORKER_SQS_CONCURRENCY:-4}
       - COORDINATOR_TIMEOUT=${COORDINATOR_TIMEOUT:-20}
       - COORDINATOR_IDLE_POLL_INTERVAL=${COORDINATOR_IDLE_POLL_INTERVAL:-2.0}
       - AUDIO_UPLOAD_FORMAT=${AUDIO_UPLOAD_FORMAT:-m4b}

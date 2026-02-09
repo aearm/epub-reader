@@ -13,3 +13,4 @@ num2words>=0.5.12
 pysbd>=0.3.4
 deep-translator>=1.11.4
 requests>=2.31.0
+boto3>=1.34.0

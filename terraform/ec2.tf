@@ -165,10 +165,12 @@ resource "aws_instance" "coordinator" {
     cognito_pool_id              = aws_cognito_user_pool.main.id
     cognito_client_id            = aws_cognito_user_pool_client.main.id
     audio_sqs_queue_url          = aws_sqs_queue.audio.url
+    audio_sqs_region             = var.worker_region
     audio_sqs_dlq_url            = aws_sqs_queue.audio_dlq.url
     audio_sqs_wait_seconds       = var.audio_sqs_receive_wait_seconds
     audio_sqs_visibility_timeout = var.audio_sqs_visibility_timeout
     audio_sqs_max_receive_count  = var.audio_sqs_max_receive_count
+    worker_shared_secret         = random_password.worker_shared_secret.result
   }))
 
   tags = {

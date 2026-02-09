@@ -13,6 +13,8 @@ import sqlite3
 import hashlib
 import time
 import json
+import hmac
+import re
 import boto3
 import threading
 import io
@@ -21,6 +23,7 @@ from array import array
 from flask import Flask, request, jsonify, g, Response, stream_with_context
 from flask_cors import CORS
 from functools import wraps
+from botocore.config import Config
 from jose import jwt, JWTError
 import requests
 from urllib.parse import unquote, urlparse
@@ -34,7 +37,7 @@ CORS(app, origins=[
 
 # Configuration from environment
 AUDIO_BUCKET = os.environ.get('AUDIO_BUCKET', 'epub-reader-audio')
-AWS_REGION = os.environ.get('AWS_REGION', 'eu-west-1')
+AWS_REGION = os.environ.get('AWS_REGION', 'us-east-2')
 COGNITO_POOL_ID = os.environ.get('COGNITO_POOL_ID', '')
 COGNITO_CLIENT_ID = os.environ.get('COGNITO_CLIENT_ID', '')
 DATABASE_PATH = os.environ.get('DATABASE_PATH', '/opt/epub-reader/coordinator.db')
@@ -54,6 +57,7 @@ MAX_GENERATE_SENTENCES = int(os.environ.get('MAX_GENERATE_SENTENCES', '6000'))
 MAX_MANIFEST_ITEMS = int(os.environ.get('MAX_MANIFEST_ITEMS', '10000'))
 AUDIO_SQS_QUEUE_URL = (os.environ.get('AUDIO_SQS_QUEUE_URL') or '').strip()
 AUDIO_SQS_DLQ_URL = (os.environ.get('AUDIO_SQS_DLQ_URL') or '').strip()
+AUDIO_SQS_REGION = (os.environ.get('AUDIO_SQS_REGION') or '').strip()
 AUDIO_SQS_WAIT_SECONDS = max(0, min(int(os.environ.get('AUDIO_SQS_WAIT_SECONDS', '2')), 20))
 AUDIO_SQS_MAX_MESSAGES = max(1, min(int(os.environ.get('AUDIO_SQS_MAX_MESSAGES', '10')), 10))
 AUDIO_SQS_VISIBILITY_TIMEOUT = max(30, int(os.environ.get('AUDIO_SQS_VISIBILITY_TIMEOUT', '180')))
@@ -63,10 +67,37 @@ AUDIO_GENERATING_STALE_SECONDS = max(
     int(os.environ.get('AUDIO_GENERATING_STALE_SECONDS', str(AUDIO_SQS_VISIBILITY_TIMEOUT)))
 )
 GENERATE_AUDIO_DB_BATCH_SIZE = max(50, int(os.environ.get('GENERATE_AUDIO_DB_BATCH_SIZE', '250')))
+OPENAI_API_KEY = (os.environ.get('OPENAI_API_KEY') or '').strip()
+OPENAI_MODEL = (os.environ.get('OPENAI_MODEL') or 'gpt-4o-mini').strip()
+OPENAI_API_BASE = (os.environ.get('OPENAI_API_BASE') or 'https://api.openai.com/v1').rstrip('/')
+BOOK_CHAT_HISTORY_LIMIT = max(6, int(os.environ.get('BOOK_CHAT_HISTORY_LIMIT', '80')))
+BOOK_CHAT_CONTEXT_LIMIT = max(4, int(os.environ.get('BOOK_CHAT_CONTEXT_LIMIT', '24')))
+BOOK_CHAT_MAX_MESSAGE_CHARS = max(200, int(os.environ.get('BOOK_CHAT_MAX_MESSAGE_CHARS', '5000')))
+BOOK_CHAT_TIMEOUT_SECONDS = max(10, int(os.environ.get('BOOK_CHAT_TIMEOUT_SECONDS', '45')))
+WORKER_SHARED_SECRET = (os.environ.get('WORKER_SHARED_SECRET') or '').strip()
+
+
+def _infer_sqs_region_from_url(queue_url):
+    if not queue_url:
+        return None
+    match = re.match(r'^https://sqs\.([a-z0-9-]+)\.amazonaws\.com/', queue_url.strip())
+    if match:
+        return match.group(1)
+    return None
+
+
+if not AUDIO_SQS_REGION:
+    AUDIO_SQS_REGION = _infer_sqs_region_from_url(AUDIO_SQS_QUEUE_URL) or AWS_REGION
 
 # S3 client
-s3_client = boto3.client('s3', region_name=AWS_REGION)
-sqs_client = boto3.client('sqs', region_name=AWS_REGION) if AUDIO_SQS_QUEUE_URL else None
+# Force regional virtual-host URLs for presigned requests so browser CORS
+# preflight does not hit global-endpoint redirects.
+s3_client = boto3.client(
+    's3',
+    region_name=AWS_REGION,
+    config=Config(signature_version='s3v4', s3={'addressing_style': 'virtual'})
+)
+sqs_client = boto3.client('sqs', region_name=AUDIO_SQS_REGION) if AUDIO_SQS_QUEUE_URL else None
 
 # Cognito JWKS URL
 COGNITO_JWKS_URL = f"https://cognito-idp.{AWS_REGION}.amazonaws.com/{COGNITO_POOL_ID}/.well-known/jwks.json"
@@ -126,6 +157,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS user_books (
             user_id TEXT NOT NULL,
             book_id TEXT NOT NULL,
+            book_hash TEXT,
             title TEXT NOT NULL,
             author TEXT DEFAULT '',
             epub_key TEXT NOT NULL,
@@ -157,7 +189,7 @@ def init_db():
             status TEXT DEFAULT 'pending',
             s3_key TEXT,
             s3_url TEXT,
-            audio_format TEXT DEFAULT 'wav',
+            audio_format TEXT DEFAULT 'm4b',
             error TEXT,
             created_at REAL NOT NULL,
             updated_at REAL NOT NULL,
@@ -165,11 +197,22 @@ def init_db():
             PRIMARY KEY(user_id, book_id, sentence_id)
         )
     ''')
+    db.execute('''
+        CREATE TABLE IF NOT EXISTS book_chat_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            book_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at REAL NOT NULL
+        )
+    ''')
     db.execute('CREATE INDEX IF NOT EXISTS idx_status ON audio_index(status)')
     db.execute('CREATE INDEX IF NOT EXISTS idx_audio_index_claimed_at ON audio_index(claimed_at)')
     db.execute('CREATE INDEX IF NOT EXISTS idx_user_books_user_last_opened ON user_books(user_id, last_opened DESC)')
     db.execute('CREATE INDEX IF NOT EXISTS idx_book_audio_owner_status ON book_audio(user_id, book_id, status)')
     db.execute('CREATE INDEX IF NOT EXISTS idx_book_audio_hash ON book_audio(hash)')
+    db.execute('CREATE INDEX IF NOT EXISTS idx_book_chat_owner_book_id ON book_chat_messages(user_id, book_id, id)')
 
     # Migrate older databases in place.
     existing_audio_cols = {
@@ -185,6 +228,14 @@ def init_db():
         db.execute("ALTER TABLE audio_index ADD COLUMN attempt_count INTEGER DEFAULT 0")
     if 'error' not in existing_audio_cols:
         db.execute("ALTER TABLE audio_index ADD COLUMN error TEXT")
+
+    existing_user_books_cols = {
+        row[1] for row in db.execute('PRAGMA table_info(user_books)').fetchall()
+    }
+    if 'book_hash' not in existing_user_books_cols:
+        db.execute("ALTER TABLE user_books ADD COLUMN book_hash TEXT")
+        db.execute("UPDATE user_books SET book_hash = book_id WHERE book_hash IS NULL OR book_hash = ''")
+    db.execute('CREATE INDEX IF NOT EXISTS idx_user_books_user_book_hash ON user_books(user_id, book_hash)')
 
     db.commit()
     db.close()
@@ -253,22 +304,90 @@ def verify_token(token):
         return None
 
 
+def _extract_worker_secret():
+    direct = (request.headers.get('X-Worker-Secret') or '').strip()
+    if direct:
+        return direct
+
+    auth_header = (request.headers.get('Authorization') or '').strip()
+    if auth_header.startswith('Worker '):
+        return auth_header[7:].strip()
+    if auth_header.startswith('Bearer worker:'):
+        return auth_header[len('Bearer worker:'):].strip()
+    return ''
+
+
+def _is_worker_authenticated():
+    if not WORKER_SHARED_SECRET:
+        return False
+    provided = _extract_worker_secret()
+    return bool(provided and hmac.compare_digest(provided, WORKER_SHARED_SECRET))
+
+
+def _set_worker_principal():
+    g.user = {
+        'sub': 'cloud-worker',
+        'username': 'cloud-worker'
+    }
+    g.auth_source = 'worker'
+
+
 def require_auth(f):
     """Decorator to require valid Cognito token."""
     @wraps(f)
     def decorated(*args, **kwargs):
-        auth_header = request.headers.get('Authorization', '')
+        auth_header = (request.headers.get('Authorization') or '').strip()
 
         if not auth_header.startswith('Bearer '):
             return jsonify({'error': 'Missing or invalid Authorization header'}), 401
 
-        token = auth_header[7:]  # Remove 'Bearer ' prefix
+        token = auth_header[7:].strip()  # Remove 'Bearer ' prefix
         payload = verify_token(token)
 
         if not payload:
             return jsonify({'error': 'Invalid or expired token'}), 401
 
         g.user = payload
+        g.auth_source = 'user'
+        return f(*args, **kwargs)
+
+    return decorated
+
+
+def require_auth_or_worker(f):
+    """Decorator to allow Cognito user auth or internal worker shared-secret auth."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        auth_header = (request.headers.get('Authorization') or '').strip()
+
+        if auth_header.startswith('Bearer '):
+            token = auth_header[7:].strip()
+            payload = verify_token(token)
+            if payload:
+                g.user = payload
+                g.auth_source = 'user'
+                return f(*args, **kwargs)
+
+        if _is_worker_authenticated():
+            _set_worker_principal()
+            return f(*args, **kwargs)
+
+        if auth_header.startswith('Bearer '):
+            return jsonify({'error': 'Invalid or expired token'}), 401
+        if _extract_worker_secret():
+            return jsonify({'error': 'Invalid worker credentials'}), 401
+        return jsonify({'error': 'Missing or invalid Authorization header'}), 401
+
+    return decorated
+
+
+def require_worker_auth(f):
+    """Decorator to require internal worker shared-secret auth."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not _is_worker_authenticated():
+            return jsonify({'error': 'Invalid worker credentials'}), 401
+        _set_worker_principal()
         return f(*args, **kwargs)
 
     return decorated
@@ -287,6 +406,16 @@ def normalize_book_id(raw_book_id):
     if not cleaned:
         return None
     return cleaned[:128]
+
+
+def normalize_book_hash(raw_book_hash, fallback_book_id=None):
+    candidate = normalize_book_id(raw_book_hash)
+    if candidate:
+        return candidate
+    fallback = normalize_book_id(fallback_book_id)
+    if fallback:
+        return fallback
+    return None
 
 
 def get_current_user_id():
@@ -318,6 +447,39 @@ def infer_audio_meta_from_url(s3_url):
     return key, 'wav'
 
 
+def get_book_manifest_key(book_hash):
+    normalized = normalize_book_hash(book_hash)
+    if not normalized:
+        return None
+    return f"books/{normalized}/manifest.json"
+
+
+def check_book_manifest_exists(book_hash):
+    key = get_book_manifest_key(book_hash)
+    if not key:
+        return False
+    try:
+        s3_client.head_object(Bucket=AUDIO_BUCKET, Key=key)
+        return True
+    except Exception:
+        return False
+
+
+def load_book_manifest(book_hash):
+    key = get_book_manifest_key(book_hash)
+    if not key:
+        return None
+    try:
+        obj = s3_client.get_object(Bucket=AUDIO_BUCKET, Key=key)
+        body = obj['Body'].read()
+        payload = json.loads(body.decode('utf-8'))
+        if isinstance(payload, dict):
+            return payload
+    except Exception:
+        return None
+    return None
+
+
 def parse_int(value, default=0):
     try:
         return int(value)
@@ -332,6 +494,170 @@ def parse_float(value, default=0.0):
         return default
 
 
+def truncate_text(value, limit):
+    if value is None:
+        return ''
+    text = str(value).strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit]
+
+
+def resolve_book_cover_url(row):
+    if not row:
+        return None
+
+    cover_key = (row['cover_key'] or '').strip() if 'cover_key' in row.keys() else ''
+    cover_url = (row['cover_url'] or '').strip() if 'cover_url' in row.keys() else ''
+
+    if cover_key:
+        try:
+            return s3_client.generate_presigned_url(
+                'get_object',
+                Params={
+                    'Bucket': AUDIO_BUCKET,
+                    'Key': cover_key
+                },
+                ExpiresIn=3600
+            )
+        except Exception:
+            pass
+
+    return cover_url or None
+
+
+def get_user_book_title(db, user_id, book_id):
+    row = db.execute(
+        'SELECT title FROM user_books WHERE user_id = ? AND book_id = ?',
+        (user_id, book_id)
+    ).fetchone()
+    if not row:
+        return None
+    return (row['title'] or '').strip() or None
+
+
+def get_user_book_hash(db, user_id, book_id):
+    row = db.execute(
+        'SELECT book_hash FROM user_books WHERE user_id = ? AND book_id = ?',
+        (user_id, book_id)
+    ).fetchone()
+    if not row:
+        return normalize_book_hash(book_id)
+    return normalize_book_hash(row['book_hash'], fallback_book_id=book_id)
+
+
+def get_book_chat_messages(db, user_id, book_id, limit=80):
+    limit = max(1, min(int(limit or 80), 200))
+    rows = db.execute(
+        '''
+        SELECT id, role, content, created_at
+        FROM book_chat_messages
+        WHERE user_id = ? AND book_id = ?
+        ORDER BY id DESC
+        LIMIT ?
+        ''',
+        (user_id, book_id, limit)
+    ).fetchall()
+    rows = list(reversed(rows))
+    return [{
+        'id': int(row['id']),
+        'role': row['role'],
+        'content': row['content'],
+        'created_at': float(row['created_at'] or 0.0),
+    } for row in rows]
+
+
+def store_book_chat_message(db, user_id, book_id, role, content):
+    now = time.time()
+    db.execute(
+        '''
+        INSERT INTO book_chat_messages (user_id, book_id, role, content, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        ''',
+        (user_id, book_id, role, truncate_text(content, BOOK_CHAT_MAX_MESSAGE_CHARS), now)
+    )
+    return now
+
+
+def trim_book_chat_messages(db, user_id, book_id, keep_count):
+    keep_count = max(20, int(keep_count or 20))
+    db.execute(
+        '''
+        DELETE FROM book_chat_messages
+        WHERE user_id = ?
+          AND book_id = ?
+          AND id NOT IN (
+              SELECT id
+              FROM book_chat_messages
+              WHERE user_id = ? AND book_id = ?
+              ORDER BY id DESC
+              LIMIT ?
+          )
+        ''',
+        (user_id, book_id, user_id, book_id, keep_count)
+    )
+
+
+def build_chat_user_message(raw_message, context):
+    message = truncate_text(raw_message, BOOK_CHAT_MAX_MESSAGE_CHARS)
+    if not message:
+        return ''
+
+    if not isinstance(context, dict):
+        return message
+
+    quote = truncate_text(context.get('quote') or '', 2000)
+    chapter_id = truncate_text(context.get('chapter_id') or '', 128)
+    sentence_index = parse_int(context.get('sentence_index'), -1)
+
+    context_lines = []
+    if chapter_id:
+        context_lines.append(f'Chapter: {chapter_id}')
+    if sentence_index >= 0:
+        context_lines.append(f'Sentence index: {sentence_index}')
+    if quote:
+        context_lines.append(f'Passage: {quote}')
+
+    if not context_lines:
+        return message
+
+    return (
+        f'Context:\n' + '\n'.join(context_lines) +
+        f'\n\nUser request:\n{message}'
+    )
+
+
+def call_openai_chat(messages):
+    if not OPENAI_API_KEY:
+        raise RuntimeError('OPENAI_API_KEY is not configured on coordinator.')
+
+    response = requests.post(
+        f'{OPENAI_API_BASE}/chat/completions',
+        headers={
+            'Authorization': f'Bearer {OPENAI_API_KEY}',
+            'Content-Type': 'application/json',
+        },
+        json={
+            'model': OPENAI_MODEL,
+            'messages': messages,
+            'temperature': 0.2,
+        },
+        timeout=BOOK_CHAT_TIMEOUT_SECONDS
+    )
+
+    if response.status_code >= 400:
+        body = response.text[:800] if response.text else ''
+        raise RuntimeError(f'OpenAI request failed ({response.status_code}) {body}'.strip())
+
+    payload = response.json()
+    reply = (
+        ((payload.get('choices') or [{}])[0].get('message') or {}).get('content') or ''
+    ).strip()
+    if not reply:
+        raise RuntimeError('OpenAI returned an empty response.')
+    return reply
+
+
 def sqs_enabled():
     return bool(AUDIO_SQS_QUEUE_URL and sqs_client)
 
@@ -340,18 +666,38 @@ def sqs_is_fifo_queue():
     return AUDIO_SQS_QUEUE_URL.lower().endswith('.fifo')
 
 
-def enqueue_audio_task(sentence_hash, text):
+def _normalize_task_payload(sentence_hash, text, book_hash=None, sentence_id=None, sentence_index=None, audio_format='m4b'):
+    payload = {
+        'hash': (sentence_hash or '').strip(),
+        'text': (text or '').strip(),
+        'enqueued_at': time.time(),
+        'format': normalize_audio_format(audio_format or 'm4b')[0]
+    }
+    normalized_book_hash = normalize_book_hash(book_hash)
+    if normalized_book_hash:
+        payload['book_hash'] = normalized_book_hash
+    if sentence_id:
+        payload['sentence_id'] = str(sentence_id).strip()
+    if sentence_index is not None:
+        payload['sentence_index'] = max(0, parse_int(sentence_index, 0))
+    return payload
+
+
+def enqueue_audio_task(sentence_hash, text, book_hash=None, sentence_id=None, sentence_index=None, audio_format='m4b'):
     """
     Push one sentence task to SQS. Returns True when enqueue request succeeds.
     """
     if not sqs_enabled():
         return False
 
-    payload = {
-        'hash': (sentence_hash or '').strip(),
-        'text': (text or '').strip(),
-        'enqueued_at': time.time(),
-    }
+    payload = _normalize_task_payload(
+        sentence_hash=sentence_hash,
+        text=text,
+        book_hash=book_hash,
+        sentence_id=sentence_id,
+        sentence_index=sentence_index,
+        audio_format=audio_format
+    )
     if not payload['hash'] or not payload['text']:
         return False
 
@@ -360,8 +706,9 @@ def enqueue_audio_task(sentence_hash, text):
         'MessageBody': json.dumps(payload, separators=(',', ':')),
     }
     if sqs_is_fifo_queue():
-        args['MessageGroupId'] = 'audio-generation'
-        args['MessageDeduplicationId'] = payload['hash']
+        group_hash = payload.get('book_hash') or 'audio-generation'
+        args['MessageGroupId'] = group_hash
+        args['MessageDeduplicationId'] = f"{group_hash}:{payload['hash']}"
 
     try:
         sqs_client.send_message(**args)
@@ -369,6 +716,72 @@ def enqueue_audio_task(sentence_hash, text):
     except Exception as e:
         print(f"Failed to enqueue SQS task {payload['hash']}: {e}")
         return False
+
+
+def enqueue_audio_tasks(tasks):
+    """
+    Push multiple tasks to SQS. Returns set of successfully enqueued hashes.
+    """
+    if not sqs_enabled():
+        return set()
+
+    normalized = []
+    for task in tasks or []:
+        if not isinstance(task, dict):
+            continue
+        payload = _normalize_task_payload(
+            sentence_hash=task.get('hash'),
+            text=task.get('text'),
+            book_hash=task.get('book_hash'),
+            sentence_id=task.get('sentence_id'),
+            sentence_index=task.get('sentence_index'),
+            audio_format=task.get('format') or task.get('audio_format') or 'm4b'
+        )
+        if not payload['hash'] or not payload['text']:
+            continue
+        normalized.append(payload)
+
+    if not normalized:
+        return set()
+
+    queued_hashes = set()
+    for start in range(0, len(normalized), 10):
+        chunk = normalized[start:start + 10]
+        entries = []
+        id_to_hash = {}
+        for idx, payload in enumerate(chunk):
+            entry_id = f"m{start + idx}"
+            id_to_hash[entry_id] = payload['hash']
+            entry = {
+                'Id': entry_id,
+                'MessageBody': json.dumps(payload, separators=(',', ':'))
+            }
+            if sqs_is_fifo_queue():
+                group_hash = payload.get('book_hash') or 'audio-generation'
+                entry['MessageGroupId'] = group_hash
+                entry['MessageDeduplicationId'] = f"{group_hash}:{payload['hash']}"
+            entries.append(entry)
+
+        try:
+            response = sqs_client.send_message_batch(
+                QueueUrl=AUDIO_SQS_QUEUE_URL,
+                Entries=entries
+            )
+        except Exception as e:
+            print(f"Failed to enqueue SQS batch ({start}-{start + len(chunk)}): {e}")
+            continue
+
+        for success in response.get('Successful') or []:
+            queued_hash = id_to_hash.get(success.get('Id'))
+            if queued_hash:
+                queued_hashes.add(queued_hash)
+
+        for failed in response.get('Failed') or []:
+            failed_hash = id_to_hash.get(failed.get('Id'))
+            if failed_hash:
+                print(f"Failed to enqueue SQS task {failed_hash}: {failed.get('Message')}")
+
+    return queued_hashes
 
 
 def _extract_task_body(message):
@@ -561,6 +974,207 @@ def refresh_user_book_audio_progress(db, user_id, book_id):
         )
     )
     return summary
+
+
+def apply_ready_hash_to_book_rows(db, sentence_hash, s3_url, preferred_format='m4b'):
+    s3_key, inferred_format = infer_audio_meta_from_url(s3_url)
+    audio_format, _ = normalize_audio_format(preferred_format or inferred_format or 'm4b')
+    now = time.time()
+    db.execute(
+        '''
+        UPDATE book_audio
+        SET status = 'ready',
+            s3_key = ?,
+            s3_url = ?,
+            audio_format = ?,
+            completed_at = ?,
+            updated_at = ?,
+            error = NULL
+        WHERE hash = ?
+        ''',
+        (s3_key, s3_url, audio_format, now, now, sentence_hash)
+    )
+    rows = db.execute(
+        'SELECT DISTINCT user_id, book_id FROM book_audio WHERE hash = ?',
+        (sentence_hash,)
+    ).fetchall()
+    return {(row['user_id'], row['book_id']) for row in rows}
+
+
+def build_book_manifest_payload(db, user_id, book_id, book_hash):
+    rows = db.execute(
+        '''
+        SELECT sentence_id, sentence_index, hash, s3_key, s3_url, audio_format
+        FROM book_audio
+        WHERE user_id = ? AND book_id = ? AND status = 'ready' AND s3_url IS NOT NULL
+        ORDER BY sentence_index ASC
+        ''',
+        (user_id, book_id)
+    ).fetchall()
+    if not rows:
+        return None
+
+    items = []
+    for row in rows:
+        items.append({
+            'sentence_id': row['sentence_id'],
+            'sentence_index': int(row['sentence_index'] or 0),
+            'hash': row['hash'],
+            'key': row['s3_key'],
+            'url': row['s3_url'],
+            'format': row['audio_format'] or 'm4b',
+        })
+
+    return {
+        'book_hash': book_hash,
+        'book_id': book_id,
+        'generated_at': time.time(),
+        'count': len(items),
+        'items': items,
+    }
+
+
+def publish_book_manifest_if_complete(db, user_id, book_id):
+    row = db.execute(
+        'SELECT book_hash FROM user_books WHERE user_id = ? AND book_id = ?',
+        (user_id, book_id)
+    ).fetchone()
+    if not row:
+        return False
+
+    book_hash = normalize_book_hash(row['book_hash'], fallback_book_id=book_id)
+    if not book_hash:
+        return False
+
+    summary = count_book_audio(db, user_id, book_id)
+    if summary['total'] <= 0 or summary['ready'] < summary['total']:
+        return False
+
+    payload = build_book_manifest_payload(db, user_id, book_id, book_hash)
+    if not payload:
+        return False
+
+    key = get_book_manifest_key(book_hash)
+    if not key:
+        return False
+
+    try:
+        s3_client.put_object(
+            Bucket=AUDIO_BUCKET,
+            Key=key,
+            Body=json.dumps(payload, separators=(',', ':')).encode('utf-8'),
+            ContentType='application/json',
+            CacheControl='no-store'
+        )
+        return True
+    except Exception as e:
+        print(f"Failed publishing book manifest for {book_id}: {e}")
+        return False
+
+
+def hydrate_book_rows_from_manifest(db, user_id, book_id, sentences, manifest_payload):
+    if not isinstance(manifest_payload, dict):
+        return 0
+
+    items = manifest_payload.get('items')
+    if not isinstance(items, list) or not items:
+        return 0
+
+    by_hash = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        sentence_hash = (item.get('hash') or '').strip()
+        url = (item.get('url') or '').strip()
+        if not sentence_hash or not url:
+            continue
+        by_hash[sentence_hash] = item
+
+    if not by_hash:
+        return 0
+
+    now = time.time()
+    applied = 0
+    for idx, entry in enumerate(sentences[:MAX_GENERATE_SENTENCES]):
+        if not isinstance(entry, dict):
+            continue
+        text = (entry.get('text') or '').strip()
+        if not text:
+            continue
+        sentence_id = (entry.get('id') or f"s_{idx}").strip()
+        if not sentence_id:
+            continue
+        sentence_index = max(0, parse_int(entry.get('sentence_index'), idx))
+        sentence_hash = (entry.get('hash') or hash_text(text)).strip()
+        if not sentence_hash:
+            continue
+        manifest_item = by_hash.get(sentence_hash)
+        if not manifest_item:
+            continue
+
+        s3_url = (manifest_item.get('url') or '').strip()
+        if not s3_url:
+            continue
+        s3_key = (manifest_item.get('key') or '').strip() or infer_audio_meta_from_url(s3_url)[0]
+        audio_format, _ = normalize_audio_format(manifest_item.get('format') or 'm4b')
+
+        db.execute(
+            '''
+            INSERT INTO audio_index (hash, text, status, s3_url, created_at, completed_at, updated_at)
+            VALUES (?, ?, 'ready', ?, ?, ?, ?)
+            ON CONFLICT(hash) DO UPDATE SET
+                text = COALESCE(NULLIF(excluded.text, ''), audio_index.text),
+                status = 'ready',
+                s3_url = excluded.s3_url,
+                completed_at = excluded.completed_at,
+                updated_at = excluded.updated_at,
+                claimed_by = NULL,
+                claimed_at = NULL,
+                queue_message_id = NULL,
+                queue_receipt_handle = NULL,
+                error = NULL
+            ''',
+            (sentence_hash, text, s3_url, now, now, now)
+        )
+
+        db.execute(
+            '''
+            INSERT INTO book_audio (
+                user_id, book_id, sentence_id, sentence_index, hash, text,
+                status, s3_key, s3_url, audio_format, error,
+                created_at, updated_at, completed_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?, NULL, ?, ?, ?)
+            ON CONFLICT(user_id, book_id, sentence_id) DO UPDATE SET
+                sentence_index = excluded.sentence_index,
+                hash = excluded.hash,
+                text = excluded.text,
+                status = 'ready',
+                s3_key = excluded.s3_key,
+                s3_url = excluded.s3_url,
+                audio_format = excluded.audio_format,
+                error = NULL,
+                updated_at = excluded.updated_at,
+                completed_at = excluded.completed_at
+            ''',
+            (
+                user_id,
+                book_id,
+                sentence_id,
+                sentence_index,
+                sentence_hash,
+                text,
+                s3_key,
+                s3_url,
+                audio_format,
+                now,
+                now,
+                now
+            )
+        )
+        applied += 1
+
+    return applied
 
 
 def claim_next_book_audio_job(user_id, book_id):
@@ -847,12 +1461,15 @@ def serialize_book_row(row):
     audio_left_count = max(0, total_sentences - ready_audio_count)
     reading_percentage = max(0.0, min(100.0, row['reading_percentage'] or 0.0))
     audio_percentage = max(0.0, min(100.0, row['audio_percentage'] or 0.0))
+    cover_url = resolve_book_cover_url(row)
 
     return {
         'book_id': row['book_id'],
+        'book_hash': normalize_book_hash(row['book_hash'], fallback_book_id=row['book_id']) if 'book_hash' in row.keys() else row['book_id'],
         'title': row['title'],
         'author': row['author'] or '',
-        'cover_url': row['cover_url'],
+        'cover_url': cover_url,
+        'cover_key': row['cover_key'],
         'epub_url': row['epub_url'],
         'total_chapters': row['total_chapters'] or 0,
         'total_sentences': total_sentences,
@@ -868,7 +1485,10 @@ def serialize_book_row(row):
             'total_sentences': total_sentences,
             'percentage': audio_percentage,
             'left_count': audio_left_count,
-            'left_percentage': max(0.0, 100.0 - audio_percentage)
+            'left_percentage': max(0.0, 100.0 - audio_percentage),
+            'pending': audio_left_count,
+            'generating': 0,
+            'failed': 0
         },
         'created_at': row['created_at'],
         'updated_at': row['updated_at'],
@@ -887,7 +1507,7 @@ def health():
 
 
 @app.route('/check', methods=['POST'])
-@require_auth
+@require_auth_or_worker
 def check_audio():
     """
     Check if audio exists for a sentence.
@@ -958,7 +1578,7 @@ def check_audio():
 
 
 @app.route('/check_batch', methods=['POST'])
-@require_auth
+@require_auth_or_worker
 def check_batch():
     """
     Check multiple sentences at once.
@@ -1047,149 +1667,13 @@ def get_tasks():
     db = get_db()
     user_id = g.user.get('sub', 'anonymous')
 
-    # Single-queue SQS mode (recommended).
+    # Single-queue SQS mode is consumed directly by workers now.
+    # Keep this endpoint backward-compatible but non-consuming.
     if sqs_enabled():
         reclaim_stale_generating_rows(db)
         backfill_pending_rows_to_sqs(db, limit=max(100, limit * 20))
         db.commit()
-
-        tasks = []
-        receive_limit = min(limit, AUDIO_SQS_MAX_MESSAGES)
-
-        try:
-            response = sqs_client.receive_message(
-                QueueUrl=AUDIO_SQS_QUEUE_URL,
-                MaxNumberOfMessages=receive_limit,
-                WaitTimeSeconds=AUDIO_SQS_WAIT_SECONDS,
-                VisibilityTimeout=AUDIO_SQS_VISIBILITY_TIMEOUT,
-                MessageAttributeNames=['All'],
-                AttributeNames=['All']
-            )
-        except Exception as e:
-            print(f"SQS receive_message failed: {e}")
-            return jsonify({'tasks': []})
-
-        now = time.time()
-        messages = response.get('Messages') or []
-        for message in messages:
-            payload = _extract_task_body(message) or {}
-            sentence_hash = (payload.get('hash') or '').strip()
-            text = (payload.get('text') or '').strip()
-            message_id = message.get('MessageId')
-            receipt_handle = message.get('ReceiptHandle')
-            receive_count = parse_int((message.get('Attributes') or {}).get('ApproximateReceiveCount'), 1)
-
-            if not sentence_hash or not text or not receipt_handle:
-                delete_sqs_message(receipt_handle)
-                continue
-
-            row = db.execute(
-                'SELECT status, s3_url FROM audio_index WHERE hash = ?',
-                (sentence_hash,)
-            ).fetchone()
-
-            if row and row['status'] == 'ready' and row['s3_url']:
-                # Duplicate/stale queue message; ready already exists.
-                delete_sqs_message(receipt_handle)
-                continue
-
-            if receive_count > AUDIO_SQS_MAX_RECEIVE_COUNT:
-                # Poison message guard: cap retries and mark as failed.
-                send_to_dlq(payload, f'max_receive_exceeded:{receive_count}')
-                delete_sqs_message(receipt_handle)
-                db.execute(
-                    '''
-                    INSERT INTO audio_index (
-                        hash, text, status, created_at, updated_at, completed_at,
-                        claimed_by, claimed_at, queue_message_id, queue_receipt_handle,
-                        attempt_count, error
-                    )
-                    VALUES (?, ?, 'failed', ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
-                    ON CONFLICT(hash) DO UPDATE SET
-                        status = 'failed',
-                        claimed_by = excluded.claimed_by,
-                        claimed_at = excluded.claimed_at,
-                        queue_message_id = NULL,
-                        queue_receipt_handle = NULL,
-                        attempt_count = excluded.attempt_count,
-                        error = excluded.error,
-                        updated_at = excluded.updated_at
-                    ''',
-                    (
-                        sentence_hash,
-                        text,
-                        now,
-                        now,
-                        now,
-                        user_id,
-                        now,
-                        receive_count,
-                        f'max_receive_exceeded:{receive_count}',
-                    )
-                )
-                continue
-
-            db.execute(
-                '''
-                INSERT INTO audio_index (
-                    hash, text, status, created_at, updated_at,
-                    claimed_by, claimed_at, queue_message_id, queue_receipt_handle,
-                    attempt_count, error
-                )
-                VALUES (?, ?, 'generating', ?, ?, ?, ?, ?, ?, ?, NULL)
-                ON CONFLICT(hash) DO UPDATE SET
-                    text = COALESCE(NULLIF(excluded.text, ''), audio_index.text),
-                    status = CASE
-                        WHEN audio_index.status = 'ready' THEN 'ready'
-                        ELSE 'generating'
-                    END,
-                    claimed_by = excluded.claimed_by,
-                    claimed_at = excluded.claimed_at,
-                    queue_message_id = excluded.queue_message_id,
-                    queue_receipt_handle = excluded.queue_receipt_handle,
-                    attempt_count = MAX(COALESCE(audio_index.attempt_count, 0), excluded.attempt_count),
-                    error = NULL,
-                    updated_at = excluded.updated_at
-                ''',
-                (
-                    sentence_hash,
-                    text,
-                    now,
-                    now,
-                    user_id,
-                    now,
-                    message_id,
-                    receipt_handle,
-                    receive_count
-                )
-            )
-
-            fresh = db.execute(
-                'SELECT status FROM audio_index WHERE hash = ?',
-                (sentence_hash,)
-            ).fetchone()
-            if fresh and fresh['status'] == 'ready':
-                # Another worker completed between receive + upsert.
-                delete_sqs_message(receipt_handle)
-                db.execute(
-                    '''
-                    UPDATE audio_index
-                    SET queue_message_id = NULL,
-                        queue_receipt_handle = NULL,
-                        updated_at = ?
-                    WHERE hash = ?
-                    ''',
-                    (time.time(), sentence_hash)
-                )
-                continue
-
-            tasks.append({
-                'hash': sentence_hash,
-                'text': text
-            })
-
-        db.commit()
-        return jsonify({'tasks': tasks})
+        return jsonify({'tasks': [], 'deprecated': True})
 
     # Legacy DB polling mode (no SQS configured).
     rows = db.execute(
@@ -1221,7 +1705,7 @@ def get_tasks():
 
 
 @app.route('/complete', methods=['POST'])
-@require_auth
+@require_auth_or_worker
 def complete_task():
     """
     Mark task as complete and store S3 URL.
@@ -1284,14 +1768,26 @@ def complete_task():
             (user_id, now, now)
         )
 
+    updated_books = apply_ready_hash_to_book_rows(db, sentence_hash, s3_url, preferred_format='m4b')
+    summaries = {}
+    for owner_id, owner_book_id in updated_books:
+        summaries[owner_book_id] = refresh_user_book_audio_progress(db, owner_id, owner_book_id)
+        publish_book_manifest_if_complete(db, owner_id, owner_book_id)
+
     db.commit()
 
     sqs_deleted = delete_sqs_message(receipt_handle)
-    return jsonify({'status': 'ok', 'idempotent': True, 'queue_deleted': bool(sqs_deleted)})
+    return jsonify({
+        'status': 'ok',
+        'idempotent': True,
+        'queue_deleted': bool(sqs_deleted),
+        'updated_books': len(updated_books),
+        'books': summaries
+    })
 
 
 @app.route('/complete_batch', methods=['POST'])
-@require_auth
+@require_auth_or_worker
 def complete_batch():
     """
     Mark multiple uploads complete.
@@ -1413,7 +1909,15 @@ def complete_batch():
                     now
                 )
             )
-            updated_books.add(book_id)
+            updated_books.add((user_id, book_id))
+
+        for owner_id, owner_book_id in apply_ready_hash_to_book_rows(
+            db,
+            sentence_hash,
+            s3_url,
+            preferred_format=audio_format
+        ):
+            updated_books.add((owner_id, owner_book_id))
 
         processed += 1
 
@@ -1430,8 +1934,9 @@ def complete_batch():
         )
 
     summaries = {}
-    for book_id in updated_books:
-        summaries[book_id] = refresh_user_book_audio_progress(db, user_id, book_id)
+    for owner_id, owner_book_id in updated_books:
+        summaries[owner_book_id] = refresh_user_book_audio_progress(db, owner_id, owner_book_id)
+        publish_book_manifest_if_complete(db, owner_id, owner_book_id)
 
     db.commit()
     queue_deleted = 0
@@ -1448,7 +1953,7 @@ def complete_batch():
 
 
 @app.route('/upload_url', methods=['POST'])
-@require_auth
+@require_auth_or_worker
 def get_upload_url():
     """
     Get presigned URL for uploading audio to S3.
@@ -1462,7 +1967,7 @@ def get_upload_url():
     if not sentence_hash:
         return jsonify({'error': 'Missing hash'}), 400
 
-    audio_ext, content_type = normalize_audio_format(data.get('format') or data.get('audio_format') or 'wav')
+    audio_ext, content_type = normalize_audio_format(data.get('format') or data.get('audio_format') or 'm4b')
 
     key = f"audio/{sentence_hash}.{audio_ext}"
 
@@ -1488,7 +1993,7 @@ def get_upload_url():
 
 
 @app.route('/upload_urls_batch', methods=['POST'])
-@require_auth
+@require_auth_or_worker
 def get_upload_urls_batch():
     """
     Get presigned URLs for multiple sentence hashes.
@@ -1516,7 +2021,7 @@ def get_upload_urls_batch():
             continue
         seen.add(sentence_hash)
 
-        audio_ext, content_type = normalize_audio_format(item.get('format') or item.get('audio_format') or 'wav')
+        audio_ext, content_type = normalize_audio_format(item.get('format') or item.get('audio_format') or 'm4b')
         key = f"audio/{sentence_hash}.{audio_ext}"
 
         upload_url = s3_client.generate_presigned_url(
@@ -1620,6 +2125,7 @@ def upsert_user_book():
     if not book_id or not title:
         return jsonify({'error': 'Missing book_id or title'}), 400
 
+    book_hash = normalize_book_hash(data.get('book_hash'), fallback_book_id=book_id)
     epub_key = (data.get('epub_key') or f"users/{user_id}/books/{book_id}.epub").strip()
     epub_url = (data.get('epub_url') or build_s3_public_url(epub_key)).strip()
     cover_key = (data.get('cover_key') or '').strip() or None
@@ -1630,11 +2136,12 @@ def upsert_user_book():
     db.execute(
         '''
         INSERT INTO user_books (
-            user_id, book_id, title, author, epub_key, epub_url, cover_key, cover_url,
+            user_id, book_id, book_hash, title, author, epub_key, epub_url, cover_key, cover_url,
             total_chapters, total_sentences, chapter_index, sentence_index, sentence_id,
             reading_percentage, ready_audio_count, audio_percentage, created_at, updated_at, last_opened
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, NULL, 0, 0, 0, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, NULL, 0, 0, 0, ?, ?, ?)
         ON CONFLICT(user_id, book_id) DO UPDATE SET
+            book_hash = COALESCE(excluded.book_hash, user_books.book_hash, user_books.book_id),
             title = excluded.title,
             author = excluded.author,
             epub_key = excluded.epub_key,
@@ -1655,6 +2162,7 @@ def upsert_user_book():
         (
             user_id,
             book_id,
+            book_hash,
             title,
             (data.get('author') or '').strip(),
             epub_key,
@@ -1668,6 +2176,21 @@ def upsert_user_book():
             now
         )
     )
+
+    if check_book_manifest_exists(book_hash):
+        total_sentences = max(0, parse_int(data.get('total_sentences'), 0))
+        ready_audio_count = total_sentences
+        audio_percentage = 100.0 if total_sentences > 0 else 0.0
+        db.execute(
+            '''
+            UPDATE user_books
+            SET ready_audio_count = ?,
+                audio_percentage = ?,
+                updated_at = ?
+            WHERE user_id = ? AND book_id = ?
+            ''',
+            (ready_audio_count, audio_percentage, time.time(), user_id, book_id)
+        )
     db.commit()
 
     row = db.execute(
@@ -1921,16 +2444,39 @@ def generate_book_audio(book_id):
         return jsonify({'error': 'Invalid sentences payload'}), 400
 
     db = get_db()
-    exists = db.execute(
-        'SELECT 1 FROM user_books WHERE user_id = ? AND book_id = ?',
+    book_row = db.execute(
+        'SELECT book_hash FROM user_books WHERE user_id = ? AND book_id = ?',
         (user_id, book_id)
     ).fetchone()
-    if not exists:
+    if not book_row:
         return jsonify({'error': 'Book not found'}), 404
+
+    book_hash = normalize_book_hash(data.get('book_hash') or book_row['book_hash'], fallback_book_id=book_id)
+    if book_hash and (book_row['book_hash'] or '').strip() != book_hash:
+        db.execute(
+            'UPDATE user_books SET book_hash = ?, updated_at = ? WHERE user_id = ? AND book_id = ?',
+            (book_hash, time.time(), user_id, book_id)
+        )
+
+    manifest_payload = load_book_manifest(book_hash) if book_hash else None
+    if manifest_payload:
+        accepted = hydrate_book_rows_from_manifest(db, user_id, book_id, sentences, manifest_payload)
+        summary = refresh_user_book_audio_progress(db, user_id, book_id)
+        db.commit()
+        return jsonify({
+            'status': 'ready',
+            'accepted': accepted,
+            'scheduled': 0,
+            'sqs_enabled': sqs_enabled(),
+            'manifest_found': True,
+            'book_hash': book_hash,
+            'audio_progress': summary
+        })
 
     now = time.time()
     accepted = 0
     scheduled = 0
+    pending_enqueue = {}
 
     for idx, item in enumerate(sentences[:MAX_GENERATE_SENTENCES]):
         if not isinstance(item, dict):
@@ -1947,7 +2493,7 @@ def generate_book_audio(book_id):
             continue
 
         existing = db.execute(
-            'SELECT status, s3_url FROM audio_index WHERE hash = ?',
+            'SELECT status, s3_url, queue_message_id FROM audio_index WHERE hash = ?',
             (sentence_hash,)
         ).fetchone()
         existing_ready = bool(existing and existing['status'] == 'ready' and existing['s3_url'])
@@ -1994,29 +2540,41 @@ def generate_book_audio(book_id):
             accepted += 1
             continue
 
-        db.execute(
-            '''
-            INSERT INTO audio_index (
-                hash, text, status, created_at, completed_at,
-                claimed_by, claimed_at, updated_at,
-                queue_message_id, queue_receipt_handle, attempt_count, error
+        should_enqueue = False
+        if existing:
+            db.execute(
+                '''
+                UPDATE audio_index
+                SET text = COALESCE(NULLIF(?, ''), text),
+                    status = CASE
+                        WHEN status = 'ready' THEN 'ready'
+                        WHEN status = 'generating' THEN 'generating'
+                        ELSE 'pending'
+                    END,
+                    updated_at = ?,
+                    error = NULL
+                WHERE hash = ?
+                ''',
+                (text, now, sentence_hash)
             )
-            VALUES (?, ?, 'pending', ?, NULL, NULL, NULL, ?, NULL, NULL, 0, NULL)
-            ON CONFLICT(hash) DO UPDATE SET
-                text = COALESCE(NULLIF(excluded.text, ''), audio_index.text),
-                status = CASE
-                    WHEN audio_index.status = 'ready' THEN 'ready'
-                    ELSE 'pending'
-                END,
-                claimed_by = NULL,
-                claimed_at = NULL,
-                queue_message_id = NULL,
-                queue_receipt_handle = NULL,
-                updated_at = excluded.updated_at,
-                error = NULL
-            ''',
-            (sentence_hash, text, now, now)
-        )
+            should_enqueue = (
+                sqs_enabled()
+                and (existing['status'] not in ('ready', 'generating'))
+                and not (existing['queue_message_id'] or '').strip()
+            )
+        else:
+            db.execute(
+                '''
+                INSERT INTO audio_index (
+                    hash, text, status, created_at, completed_at,
+                    claimed_by, claimed_at, updated_at,
+                    queue_message_id, queue_receipt_handle, attempt_count, error
+                )
+                VALUES (?, ?, 'pending', ?, NULL, NULL, NULL, ?, NULL, NULL, 0, NULL)
+                ''',
+                (sentence_hash, text, now, now)
+            )
+            should_enqueue = sqs_enabled()
 
         db.execute(
             '''
@@ -2025,7 +2583,7 @@ def generate_book_audio(book_id):
                 status, s3_key, s3_url, audio_format, error,
                 created_at, updated_at, completed_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, 'wav', NULL, ?, ?, NULL)
+            VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, 'm4b', NULL, ?, ?, NULL)
             ON CONFLICT(user_id, book_id, sentence_id) DO UPDATE SET
                 sentence_index = excluded.sentence_index,
                 hash = excluded.hash,
@@ -2049,15 +2607,34 @@ def generate_book_audio(book_id):
             )
         )
 
+        if should_enqueue and sentence_hash not in pending_enqueue:
+            pending_enqueue[sentence_hash] = {
+                'hash': sentence_hash,
+                'text': text,
+                'book_hash': book_hash,
+                'sentence_id': sentence_id,
+                'sentence_index': sentence_index,
+                'format': 'm4b'
+            }
+
         accepted += 1
 
         if accepted % GENERATE_AUDIO_DB_BATCH_SIZE == 0:
             db.commit()
 
-    # SQS enqueue is deferred to /tasks backfill to keep this user-facing endpoint fast.
-    # This avoids long DB write locks and worker timeouts on very large book imports.
-    if sqs_enabled():
-        scheduled = 0
+    if sqs_enabled() and pending_enqueue:
+        queued_hashes = enqueue_audio_tasks(list(pending_enqueue.values()))
+        scheduled = len(queued_hashes)
+        if queued_hashes:
+            db.executemany(
+                '''
+                UPDATE audio_index
+                SET queue_message_id = 'queued',
+                    updated_at = ?
+                WHERE hash = ? AND status = 'pending'
+                ''',
+                [(time.time(), h) for h in queued_hashes]
+            )
 
     summary = refresh_user_book_audio_progress(db, user_id, book_id)
     db.commit()
@@ -2067,6 +2644,8 @@ def generate_book_audio(book_id):
         'accepted': accepted,
         'scheduled': scheduled,
         'sqs_enabled': sqs_enabled(),
+        'manifest_found': False,
+        'book_hash': book_hash,
         'audio_progress': summary
     })
 
@@ -2080,12 +2659,14 @@ def get_book_audio_progress(book_id):
         return jsonify({'error': 'Invalid book_id'}), 400
 
     db = get_db()
-    exists = db.execute(
-        'SELECT 1 FROM user_books WHERE user_id = ? AND book_id = ?',
+    book_row = db.execute(
+        'SELECT book_hash FROM user_books WHERE user_id = ? AND book_id = ?',
         (user_id, book_id)
     ).fetchone()
-    if not exists:
+    if not book_row:
         return jsonify({'error': 'Book not found'}), 404
+
+    book_hash = normalize_book_hash(book_row['book_hash'], fallback_book_id=book_id)
 
     summary = refresh_user_book_audio_progress(db, user_id, book_id)
     db.commit()
@@ -2124,6 +2705,89 @@ def get_book_audio_manifest(book_id):
         (user_id, book_id, limit)
     ).fetchall()
 
+    if not rows and book_hash:
+        manifest_payload = load_book_manifest(book_hash)
+        if manifest_payload:
+            items = manifest_payload.get('items')
+            if isinstance(items, list):
+                count = 0
+                now = time.time()
+                for item in items:
+                    if count >= limit:
+                        break
+                    if not isinstance(item, dict):
+                        continue
+                    sentence_hash = (item.get('hash') or '').strip()
+                    sentence_id = (item.get('sentence_id') or '').strip()
+                    s3_url = (item.get('url') or '').strip()
+                    if not sentence_hash or not sentence_id or not s3_url:
+                        continue
+                    sentence_index = max(0, parse_int(item.get('sentence_index'), 0))
+                    s3_key = (item.get('key') or '').strip() or infer_audio_meta_from_url(s3_url)[0]
+                    audio_format, _ = normalize_audio_format(item.get('format') or 'm4b')
+                    db.execute(
+                        '''
+                        INSERT INTO book_audio (
+                            user_id, book_id, sentence_id, sentence_index, hash, text,
+                            status, s3_key, s3_url, audio_format, error,
+                            created_at, updated_at, completed_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, '', 'ready', ?, ?, ?, NULL, ?, ?, ?)
+                        ON CONFLICT(user_id, book_id, sentence_id) DO UPDATE SET
+                            sentence_index = excluded.sentence_index,
+                            hash = excluded.hash,
+                            status = 'ready',
+                            s3_key = excluded.s3_key,
+                            s3_url = excluded.s3_url,
+                            audio_format = excluded.audio_format,
+                            error = NULL,
+                            updated_at = excluded.updated_at,
+                            completed_at = excluded.completed_at
+                        ''',
+                        (
+                            user_id,
+                            book_id,
+                            sentence_id,
+                            sentence_index,
+                            sentence_hash,
+                            s3_key,
+                            s3_url,
+                            audio_format,
+                            now,
+                            now,
+                            now
+                        )
+                    )
+                    db.execute(
+                        '''
+                        INSERT INTO audio_index (hash, text, status, s3_url, created_at, completed_at, updated_at)
+                        VALUES (?, '', 'ready', ?, ?, ?, ?)
+                        ON CONFLICT(hash) DO UPDATE SET
+                            status = 'ready',
+                            s3_url = excluded.s3_url,
+                            completed_at = excluded.completed_at,
+                            updated_at = excluded.updated_at,
+                            claimed_by = NULL,
+                            claimed_at = NULL,
+                            queue_message_id = NULL,
+                            queue_receipt_handle = NULL,
+                            error = NULL
+                        ''',
+                        (sentence_hash, s3_url, now, now, now)
+                    )
+                    count += 1
+
+                rows = db.execute(
+                    '''
+                    SELECT sentence_id, sentence_index, hash, s3_url, audio_format
+                    FROM book_audio
+                    WHERE user_id = ? AND book_id = ? AND status = 'ready' AND s3_url IS NOT NULL
+                    ORDER BY sentence_index ASC
+                    LIMIT ?
+                    ''',
+                    (user_id, book_id, limit)
+                ).fetchall()
+
     summary = refresh_user_book_audio_progress(db, user_id, book_id)
     db.commit()
 
@@ -2132,7 +2796,7 @@ def get_book_audio_manifest(book_id):
         'sentence_index': row['sentence_index'] or 0,
         'hash': row['hash'],
         'url': row['s3_url'],
-        'format': row['audio_format'] or 'wav'
+        'format': row['audio_format'] or 'm4b'
     } for row in rows]
 
     return jsonify({
@@ -2140,6 +2804,115 @@ def get_book_audio_manifest(book_id):
         'count': len(items),
         'items': items,
         'audio_progress': summary
+    })
+
+
+@app.route('/books/<book_id>/chat_history', methods=['GET'])
+@require_auth
+def get_book_chat_history(book_id):
+    user_id = get_current_user_id()
+    book_id = normalize_book_id(book_id)
+    if not book_id:
+        return jsonify({'error': 'Invalid book_id'}), 400
+
+    db = get_db()
+    if not get_user_book_title(db, user_id, book_id):
+        return jsonify({'error': 'Book not found'}), 404
+
+    limit = parse_int(request.args.get('limit'), BOOK_CHAT_HISTORY_LIMIT)
+    messages = get_book_chat_messages(db, user_id, book_id, limit=limit)
+    return jsonify({
+        'book_id': book_id,
+        'messages': messages
+    })
+
+
+@app.route('/books/<book_id>/chat_history', methods=['DELETE'])
+@require_auth
+def clear_book_chat_history(book_id):
+    user_id = get_current_user_id()
+    book_id = normalize_book_id(book_id)
+    if not book_id:
+        return jsonify({'error': 'Invalid book_id'}), 400
+
+    db = get_db()
+    if not get_user_book_title(db, user_id, book_id):
+        return jsonify({'error': 'Book not found'}), 404
+
+    before = db.execute(
+        'SELECT COUNT(*) AS c FROM book_chat_messages WHERE user_id = ? AND book_id = ?',
+        (user_id, book_id)
+    ).fetchone()
+    db.execute(
+        'DELETE FROM book_chat_messages WHERE user_id = ? AND book_id = ?',
+        (user_id, book_id)
+    )
+    db.commit()
+
+    return jsonify({
+        'ok': True,
+        'book_id': book_id,
+        'cleared': int((before['c'] if before else 0) or 0)
+    })
+
+
+@app.route('/books/<book_id>/chat', methods=['POST'])
+@require_auth
+def book_chat(book_id):
+    user_id = get_current_user_id()
+    book_id = normalize_book_id(book_id)
+    if not book_id:
+        return jsonify({'error': 'Invalid book_id'}), 400
+
+    if not OPENAI_API_KEY:
+        return jsonify({'error': 'OPENAI_API_KEY is not configured on coordinator.'}), 503
+
+    data = request.json or {}
+    user_message = truncate_text(data.get('message') or '', BOOK_CHAT_MAX_MESSAGE_CHARS)
+    if not user_message:
+        return jsonify({'error': 'Missing message'}), 400
+
+    context_payload = data.get('context') if isinstance(data.get('context'), dict) else {}
+
+    db = get_db()
+    book_title = get_user_book_title(db, user_id, book_id)
+    if not book_title:
+        return jsonify({'error': 'Book not found'}), 404
+
+    history_rows = get_book_chat_messages(db, user_id, book_id, limit=BOOK_CHAT_CONTEXT_LIMIT)
+    model_messages = [{
+        'role': 'system',
+        'content': (
+            'You are an EPUB reading companion. Keep answers concise, practical, and grounded in the passage. '
+            'Use the conversation history for continuity. If asked about content not in context, say so clearly. '
+            f'Current book: "{book_title}".'
+        )
+    }]
+    model_messages.extend({
+        'role': row['role'],
+        'content': row['content']
+    } for row in history_rows)
+    model_messages.append({
+        'role': 'user',
+        'content': build_chat_user_message(user_message, context_payload)
+    })
+
+    try:
+        assistant_reply = call_openai_chat(model_messages)
+    except Exception as e:
+        return jsonify({'error': f'Chat request failed: {str(e)}'}), 502
+
+    store_book_chat_message(db, user_id, book_id, 'user', user_message)
+    store_book_chat_message(db, user_id, book_id, 'assistant', assistant_reply)
+    trim_book_chat_messages(db, user_id, book_id, keep_count=BOOK_CHAT_HISTORY_LIMIT)
+    db.commit()
+
+    latest_messages = get_book_chat_messages(db, user_id, book_id, limit=BOOK_CHAT_HISTORY_LIMIT)
+    return jsonify({
+        'book_id': book_id,
+        'reply': assistant_reply,
+        'model': OPENAI_MODEL,
+        'messages': latest_messages
     })
 
 

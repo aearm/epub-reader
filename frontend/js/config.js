@@ -10,14 +10,14 @@ window.EPUB_READER_CONFIG = {
 
     // Cognito Configuration
     cognito: {
-        userPoolId: 'eu-west-1_Vc73UMTPO',
-        clientId: '4elcqdsla61mcpnagsrlqc0fn0',
-        domain: 'https://epub-reader-fe777fa8.auth.eu-west-1.amazoncognito.com',
-        region: 'eu-west-1'
+        userPoolId: 'us-east-2_U0N41k1IT',
+        clientId: '12c5fvb8b1q2dpunuc35vef7t4',
+        domain: 'https://epub-reader-fe777fa8.auth.us-east-2.amazoncognito.com',
+        region: 'us-east-2'
     },
 
     // S3 Audio Bucket
-    audioBucketUrl: 'https://epub-reader-audio-fe777fa8.s3.eu-west-1.amazonaws.com',
+    audioBucketUrl: 'https://epub-reader-audio-useast2-fe777fa8.s3.us-east-2.amazonaws.com',
 
     // Feature Flags
     features: {

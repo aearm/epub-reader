@@ -38,6 +38,11 @@ output "audio_sqs_queue_url" {
   value       = aws_sqs_queue.audio.url
 }
 
+output "audio_sqs_region" {
+  description = "Region where audio SQS queue is provisioned"
+  value       = var.worker_region
+}
+
 output "audio_sqs_dlq_url" {
   description = "DLQ URL for failed audio generation jobs"
   value       = aws_sqs_queue.audio_dlq.url
@@ -86,4 +91,25 @@ output "ssh_command" {
 output "cloudfront_distribution_id" {
   description = "CloudFront distribution ID for cache invalidation"
   value       = aws_cloudfront_distribution.frontend.id
+}
+
+output "cloud_worker_ecr_repository_url" {
+  description = "ECR repository URL for cloud GPU worker image"
+  value       = aws_ecr_repository.cloud_worker.repository_url
+}
+
+output "cloud_worker_ecs_cluster_name" {
+  description = "ECS cluster name for cloud worker"
+  value       = aws_ecs_cluster.cloud_worker.name
+}
+
+output "cloud_worker_ecs_service_name" {
+  description = "ECS service name for cloud worker"
+  value       = aws_ecs_service.cloud_worker.name
+}
+
+output "worker_shared_secret" {
+  description = "Shared secret used by cloud worker to authenticate to coordinator"
+  value       = random_password.worker_shared_secret.result
+  sensitive   = true
 }

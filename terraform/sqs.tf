@@ -1,6 +1,7 @@
 # SQS dead-letter queue for failed audio generation messages
 resource "aws_sqs_queue" "audio_dlq" {
-  name = "${var.project_name}-audio-dlq-${random_id.bucket_suffix.hex}"
+  provider = aws.us_east_2
+  name     = "${var.project_name}-audio-dlq-${random_id.bucket_suffix.hex}"
 
   # Keep failed messages for up to 14 days for inspection/replay.
   message_retention_seconds = 1209600
@@ -13,7 +14,8 @@ resource "aws_sqs_queue" "audio_dlq" {
 
 # Main audio generation queue (single queue mode)
 resource "aws_sqs_queue" "audio" {
-  name = "${var.project_name}-audio-jobs-${random_id.bucket_suffix.hex}"
+  provider = aws.us_east_2
+  name     = "${var.project_name}-audio-jobs-${random_id.bucket_suffix.hex}"
 
   visibility_timeout_seconds = var.audio_sqs_visibility_timeout
   receive_wait_time_seconds  = var.audio_sqs_receive_wait_seconds

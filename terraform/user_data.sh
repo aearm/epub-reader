@@ -19,10 +19,12 @@ AWS_REGION=${aws_region}
 COGNITO_POOL_ID=${cognito_pool_id}
 COGNITO_CLIENT_ID=${cognito_client_id}
 AUDIO_SQS_QUEUE_URL=${audio_sqs_queue_url}
+AUDIO_SQS_REGION=${audio_sqs_region}
 AUDIO_SQS_DLQ_URL=${audio_sqs_dlq_url}
 AUDIO_SQS_WAIT_SECONDS=${audio_sqs_wait_seconds}
 AUDIO_SQS_VISIBILITY_TIMEOUT=${audio_sqs_visibility_timeout}
 AUDIO_SQS_MAX_RECEIVE_COUNT=${audio_sqs_max_receive_count}
+WORKER_SHARED_SECRET=${worker_shared_secret}
 EOF
 
 # Create virtual environment

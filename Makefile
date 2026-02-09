@@ -1,7 +1,7 @@
 # EPUB Reader Deployment Makefile
 # Usage: make <target>
 
-.PHONY: help setup init plan apply deploy deploy-backend deploy-frontend destroy ssh clean watch-jobs
+.PHONY: help setup init plan apply deploy deploy-backend deploy-frontend deploy-cloud-worker destroy ssh clean watch-jobs
 
 # Variables
 TERRAFORM_DIR = terraform
@@ -65,7 +65,7 @@ outputs: ## Show Terraform outputs
 # Deployment
 # =============================================================================
 
-deploy: generate-config deploy-backend deploy-frontend ## Deploy everything
+deploy: generate-config deploy-backend deploy-frontend deploy-cloud-worker ## Deploy everything
 
 generate-config: ## Generate frontend config from Terraform outputs
 	@echo "$(YELLOW)Generating frontend config...$(NC)"
@@ -74,12 +74,13 @@ generate-config: ## Generate frontend config from Terraform outputs
 	$(eval COGNITO_CLIENT_ID := $(shell cd $(TERRAFORM_DIR) && terraform output -raw cognito_client_id 2>/dev/null))
 	$(eval COGNITO_DOMAIN := $(shell cd $(TERRAFORM_DIR) && terraform output -raw cognito_domain 2>/dev/null))
 	$(eval AUDIO_BUCKET_URL := $(shell cd $(TERRAFORM_DIR) && terraform output -raw audio_bucket_url 2>/dev/null))
+	$(eval AWS_REGION := $(shell cd $(TERRAFORM_DIR) && terraform output -raw aws_region 2>/dev/null || echo "us-east-2"))
 	@sed -e 's|$${API_URL}|$(API_URL)|g' \
 		-e 's|$${COGNITO_USER_POOL_ID}|$(COGNITO_POOL_ID)|g' \
 		-e 's|$${COGNITO_CLIENT_ID}|$(COGNITO_CLIENT_ID)|g' \
 		-e 's|$${COGNITO_DOMAIN}|$(COGNITO_DOMAIN)|g' \
 		-e 's|$${AUDIO_BUCKET_URL}|$(AUDIO_BUCKET_URL)|g' \
-		-e 's|$${AWS_REGION}|eu-west-1|g' \
+		-e 's|$${AWS_REGION}|$(AWS_REGION)|g' \
 		$(FRONTEND_DIR)/js/config.js.template > $(FRONTEND_DIR)/js/config.js
 	@echo "$(GREEN)Config generated at $(FRONTEND_DIR)/js/config.js$(NC)"
 
@@ -87,14 +88,16 @@ deploy-backend: ## Deploy backend to EC2
 	@echo "$(YELLOW)Deploying backend...$(NC)"
 	$(eval EC2_IP := $(shell cd $(TERRAFORM_DIR) && terraform output -raw ec2_public_ip 2>/dev/null))
 	$(eval AUDIO_BUCKET := $(shell cd $(TERRAFORM_DIR) && terraform output -raw audio_bucket 2>/dev/null))
-	$(eval AWS_REGION := $(shell cd $(TERRAFORM_DIR) && terraform output -raw aws_region 2>/dev/null || echo "eu-west-1"))
+	$(eval AWS_REGION := $(shell cd $(TERRAFORM_DIR) && terraform output -raw aws_region 2>/dev/null || echo "us-east-2"))
 	$(eval COGNITO_POOL_ID := $(shell cd $(TERRAFORM_DIR) && terraform output -raw cognito_user_pool_id 2>/dev/null))
 	$(eval COGNITO_CLIENT_ID := $(shell cd $(TERRAFORM_DIR) && terraform output -raw cognito_client_id 2>/dev/null))
 	$(eval AUDIO_SQS_QUEUE_URL := $(shell cd $(TERRAFORM_DIR) && terraform output -raw audio_sqs_queue_url 2>/dev/null || echo ""))
+	$(eval AUDIO_SQS_REGION := $(shell cd $(TERRAFORM_DIR) && terraform output -raw audio_sqs_region 2>/dev/null || echo "$(AWS_REGION)"))
 	$(eval AUDIO_SQS_DLQ_URL := $(shell cd $(TERRAFORM_DIR) && terraform output -raw audio_sqs_dlq_url 2>/dev/null || echo ""))
 	$(eval AUDIO_SQS_WAIT_SECONDS := $(shell cd $(TERRAFORM_DIR) && terraform output -raw audio_sqs_wait_seconds 2>/dev/null || echo "2"))
 	$(eval AUDIO_SQS_VISIBILITY_TIMEOUT := $(shell cd $(TERRAFORM_DIR) && terraform output -raw audio_sqs_visibility_timeout 2>/dev/null || echo "180"))
 	$(eval AUDIO_SQS_MAX_RECEIVE_COUNT := $(shell cd $(TERRAFORM_DIR) && terraform output -raw audio_sqs_max_receive_count 2>/dev/null || echo "8"))
+	$(eval WORKER_SHARED_SECRET := $(shell cd $(TERRAFORM_DIR) && terraform output -raw worker_shared_secret 2>/dev/null || echo ""))
 	@if [ -z "$(EC2_IP)" ]; then \
 		echo "Error: Could not get EC2 IP. Run 'make apply' first."; \
 		exit 1; \
@@ -115,10 +118,15 @@ deploy-backend: ## Deploy backend to EC2
 			'COGNITO_POOL_ID=$(COGNITO_POOL_ID)' \
 			'COGNITO_CLIENT_ID=$(COGNITO_CLIENT_ID)' \
 			'AUDIO_SQS_QUEUE_URL=$(AUDIO_SQS_QUEUE_URL)' \
+			'AUDIO_SQS_REGION=$(AUDIO_SQS_REGION)' \
 			'AUDIO_SQS_DLQ_URL=$(AUDIO_SQS_DLQ_URL)' \
 			'AUDIO_SQS_WAIT_SECONDS=$(AUDIO_SQS_WAIT_SECONDS)' \
 			'AUDIO_SQS_VISIBILITY_TIMEOUT=$(AUDIO_SQS_VISIBILITY_TIMEOUT)' \
 			'AUDIO_SQS_MAX_RECEIVE_COUNT=$(AUDIO_SQS_MAX_RECEIVE_COUNT)' \
+			'WORKER_SHARED_SECRET=$(WORKER_SHARED_SECRET)' \
+			'OPENAI_API_KEY=$(OPENAI_API_KEY)' \
+			'OPENAI_MODEL=$(OPENAI_MODEL)' \
+			'OPENAI_API_BASE=$(OPENAI_API_BASE)' \
 			> /opt/epub-reader/.env"
 	@echo "Setting up Python environment..."
 	ssh -i $(SSH_KEY_PATH) ec2-user@$(EC2_IP) \
@@ -127,6 +135,30 @@ deploy-backend: ## Deploy backend to EC2
 	ssh -i $(SSH_KEY_PATH) ec2-user@$(EC2_IP) \
 		"sudo systemctl restart coordinator || echo 'Service not configured yet'"
 	@echo "$(GREEN)Backend deployed!$(NC)"
+
+deploy-cloud-worker: ## Build/push cloud worker image and roll ECS service
+	@echo "$(YELLOW)Deploying cloud worker...$(NC)"
+	$(eval WORKER_REGION := $(shell cd $(TERRAFORM_DIR) && terraform output -raw audio_sqs_region 2>/dev/null || echo "us-east-2"))
+	$(eval ECR_REPO := $(shell cd $(TERRAFORM_DIR) && terraform output -raw cloud_worker_ecr_repository_url 2>/dev/null))
+	$(eval ECS_CLUSTER := $(shell cd $(TERRAFORM_DIR) && terraform output -raw cloud_worker_ecs_cluster_name 2>/dev/null))
+	$(eval ECS_SERVICE := $(shell cd $(TERRAFORM_DIR) && terraform output -raw cloud_worker_ecs_service_name 2>/dev/null))
+	@if [ -z "$(ECR_REPO)" ] || [ -z "$(ECS_CLUSTER)" ] || [ -z "$(ECS_SERVICE)" ]; then \
+		echo "Error: Missing cloud worker outputs. Run 'make apply' first."; \
+		exit 1; \
+	fi
+	@echo "Logging in to ECR ($(WORKER_REGION))..."
+	aws ecr get-login-password --region $(WORKER_REGION) | docker login --username AWS --password-stdin $$(echo $(ECR_REPO) | cut -d/ -f1)
+	@echo "Building cloud worker image..."
+	docker build -f cloud_worker/Dockerfile -t $(ECR_REPO):latest cloud_worker
+	@echo "Pushing cloud worker image..."
+	docker push $(ECR_REPO):latest
+	@echo "Forcing ECS rollout..."
+	aws ecs update-service \
+		--region $(WORKER_REGION) \
+		--cluster $(ECS_CLUSTER) \
+		--service $(ECS_SERVICE) \
+		--force-new-deployment > /dev/null
+	@echo "$(GREEN)Cloud worker deployed!$(NC)"
 
 deploy-frontend: ## Deploy frontend to S3
 	@echo "$(YELLOW)Deploying frontend...$(NC)"
@@ -179,7 +211,7 @@ create-user: ## Create a new Cognito user (usage: make create-user EMAIL=user@ex
 		--user-pool-id $(POOL_ID) \
 		--username $(EMAIL) \
 		--user-attributes Name=email,Value=$(EMAIL) Name=email_verified,Value=true \
-		--region eu-west-1
+		--region $$(cd $(TERRAFORM_DIR) && terraform output -raw aws_region 2>/dev/null || echo "us-east-2")
 	@echo "$(GREEN)User created! They will receive an email with temporary password.$(NC)"
 
 clean: ## Clean local build artifacts

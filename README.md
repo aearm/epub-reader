@@ -73,6 +73,11 @@ Coordinator SQS queue options (single queue mode):
 - `AUDIO_SQS_VISIBILITY_TIMEOUT` (seconds, default `180`)
 - `AUDIO_SQS_MAX_RECEIVE_COUNT` (max retries before fail/DLQ, default `8`)
 
+Coordinator AI chat options:
+- `OPENAI_API_KEY` (required to enable per-book AI discussion)
+- `OPENAI_MODEL` (optional, default `gpt-4o-mini`)
+- `OPENAI_API_BASE` (optional, default `https://api.openai.com/v1`)
+
 ## Run Local Worker (Docker)
 
 Use this when reading from `https://reader.psybytes.com` and you want local Kokoro generation on your machine.

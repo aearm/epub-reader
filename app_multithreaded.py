@@ -22,6 +22,7 @@ from urllib.parse import urljoin
 import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import boto3
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'your-secret-key'
@@ -63,6 +64,11 @@ ALLOWED_EXTENSIONS = {'epub'}
 COORDINATOR_API_URL = (
     os.environ.get('COORDINATOR_API_URL') or 'https://api.reader.psybytes.com'
 ).strip().rstrip('/')
+AWS_REGION = (os.environ.get('AWS_REGION') or 'us-east-2').strip()
+WORKER_AUDIO_SQS_QUEUE_URL = (os.environ.get('AUDIO_SQS_QUEUE_URL') or '').strip()
+WORKER_AUDIO_SQS_WAIT_SECONDS = max(0, min(int(os.environ.get('AUDIO_SQS_WAIT_SECONDS', '10')), 20))
+WORKER_AUDIO_SQS_MAX_MESSAGES = max(1, min(int(os.environ.get('AUDIO_SQS_MAX_MESSAGES', '10')), 10))
+WORKER_AUDIO_SQS_VISIBILITY_TIMEOUT = max(30, int(os.environ.get('AUDIO_SQS_VISIBILITY_TIMEOUT', '180')))
 COORDINATOR_BEARER_TOKEN = os.environ.get('COORDINATOR_BEARER_TOKEN', '').strip()
 COORDINATOR_TIMEOUT = float(os.environ.get('COORDINATOR_TIMEOUT', '20'))
 COORDINATOR_BATCH_SIZE = 100
@@ -95,8 +101,11 @@ WORKER_UPLOAD_URL_BATCH_SIZE = max(1, int(os.environ.get('WORKER_UPLOAD_URL_BATC
 WORKER_COMPLETE_BATCH_SIZE = max(1, int(os.environ.get('WORKER_COMPLETE_BATCH_SIZE', '50')))
 WORKER_MP3_BITRATE = os.environ.get('WORKER_MP3_BITRATE', '64k').strip() or '64k'
 WORKER_MP3_SAMPLE_RATE = str(int(os.environ.get('WORKER_MP3_SAMPLE_RATE', '24000')))
-COORDINATOR_IDLE_POLL_INTERVAL = max(0.5, float(os.environ.get('COORDINATOR_IDLE_POLL_INTERVAL', '2.0')))
 WORKER_IDLE_BACKFILL_ENABLED = os.environ.get('WORKER_IDLE_BACKFILL_ENABLED', '1').strip().lower() not in ('0', 'false', 'no')
+WORKER_SQS_CONCURRENCY = max(
+    1,
+    min(16, int(os.environ.get('WORKER_SQS_CONCURRENCY', str(min(4, WORKER_TTS_POOL_SIZE)))))
+)
 COORDINATOR_TOKEN_STATE_PATH = (
     os.environ.get('COORDINATOR_TOKEN_STATE_PATH') or 'static/state/coordinator_token.json'
 ).strip()
@@ -130,15 +139,17 @@ current_page_sentences = []  # list of sentence_ids for currently visible page
 sentence_hashes = {}          # sentence_id -> coordinator hash
 sentence_remote_urls = {}     # sentence_id -> S3 URL
 coordinator_enabled = bool(COORDINATOR_API_URL)
+worker_sqs_enabled = bool(WORKER_AUDIO_SQS_QUEUE_URL)
+worker_sqs_client = boto3.client('sqs', region_name=AWS_REGION) if worker_sqs_enabled else None
 coordinator_sync_lock = threading.Lock()
 coordinator_metrics = {
     'requests_ok': 0,
     'requests_failed': 0,
     'uploads_ok': 0,
     'uploads_failed': 0,
-    'idle_tasks_claimed': 0,
-    'idle_tasks_completed': 0,
-    'idle_tasks_failed': 0,
+    'idle_tasks_claimed': 0,   # SQS messages claimed
+    'idle_tasks_completed': 0, # SQS messages completed+acked
+    'idle_tasks_failed': 0,    # SQS messages failed (left for retry)
     'last_error': None
 }
 runtime_coordinator_token = None
@@ -146,9 +157,7 @@ runtime_token_lock = threading.Lock()
 book_jobs = {}
 book_jobs_lock = threading.Lock()
 idle_backfill_lock = threading.Lock()
-idle_task_poll_lock = threading.Lock()
-idle_task_backoff_until = 0.0
-idle_backfill_thread = None
+idle_backfill_threads = []
 
 if coordinator_enabled and not COORDINATOR_BEARER_TOKEN:
     print("WARNING: Coordinator is enabled without startup token. "
@@ -306,17 +315,22 @@ def cache_remote_audio(remote_url: str, target_path: str) -> bool:
         return False
 
 
-def upload_audio_to_coordinator(sentence_hash: str, audio_path: str):
+def upload_audio_to_coordinator(sentence_hash: str, audio_path: str, upload_format: str = None, book_hash: str = None):
     """Upload generated audio to S3 via coordinator and mark task complete."""
     if not coordinator_enabled:
         return None
 
-    asset = audio_backend.build_upload_asset(audio_path, AUDIO_UPLOAD_FORMAT)
+    effective_format = normalize_upload_format(upload_format or AUDIO_UPLOAD_FORMAT)
+    asset = audio_backend.build_upload_asset(audio_path, effective_format)
 
     upload = coordinator_request(
         'POST',
         '/upload_url',
-        json_data={'hash': sentence_hash, 'format': asset.audio_format}
+        json_data={
+            'hash': sentence_hash,
+            'format': asset.audio_format,
+            'book_hash': (book_hash or '').strip() or None
+        }
     )
     if not upload:
         coordinator_metrics['uploads_failed'] += 1
@@ -406,92 +420,120 @@ def generate_sentence_locally(sentence_hash: str, text: str, output_dir: str):
     )
 
 
+def extract_sqs_task_body(message):
+    raw = (message or {}).get('Body')
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return None
+
+    if isinstance(payload, dict) and isinstance(payload.get('Message'), str):
+        try:
+            nested = json.loads(payload['Message'])
+            if isinstance(nested, dict):
+                payload = nested
+        except Exception:
+            pass
+
+    return payload if isinstance(payload, dict) else None
+
+
+def delete_worker_sqs_message(receipt_handle: str):
+    if not worker_sqs_client or not WORKER_AUDIO_SQS_QUEUE_URL or not receipt_handle:
+        return False
+    try:
+        worker_sqs_client.delete_message(
+            QueueUrl=WORKER_AUDIO_SQS_QUEUE_URL,
+            ReceiptHandle=receipt_handle
+        )
+        return True
+    except Exception as e:
+        coordinator_metrics['last_error'] = f'sqs delete failed: {str(e)}'
+        return False
+
+
 def process_idle_coordinator_task_once():
     """
-    Generate one coordinator-pending sentence when the local priority queue is empty.
-    This keeps current/nearby-page work highest priority and uses only spare capacity
-    for other books.
+    Consume one SQS message and process it end-to-end:
+    generate local audio -> upload to S3 via coordinator -> delete SQS message.
     """
-    global idle_task_backoff_until
-
+    if not WORKER_IDLE_BACKFILL_ENABLED:
+        return False
+    if not worker_sqs_enabled or not worker_sqs_client:
+        return False
     if not coordinator_enabled or not get_effective_coordinator_token():
         return False
 
-    # Only one worker performs idle backfill at a time.
+    # Only one SQS consumer thread executes the claim/generate/upload cycle at a time.
     if not idle_backfill_lock.acquire(blocking=False):
         return False
 
     try:
-        now = time.time()
-        with idle_task_poll_lock:
-            if now < idle_task_backoff_until:
-                return False
-
-        result = coordinator_request('GET', '/tasks?limit=1')
-        tasks = (result or {}).get('tasks') or []
-        if not tasks:
-            with idle_task_poll_lock:
-                idle_task_backoff_until = time.time() + COORDINATOR_IDLE_POLL_INTERVAL
+        response = worker_sqs_client.receive_message(
+            QueueUrl=WORKER_AUDIO_SQS_QUEUE_URL,
+            MaxNumberOfMessages=1,
+            WaitTimeSeconds=WORKER_AUDIO_SQS_WAIT_SECONDS,
+            VisibilityTimeout=WORKER_AUDIO_SQS_VISIBILITY_TIMEOUT,
+            AttributeNames=['All']
+        )
+        messages = response.get('Messages') or []
+        if not messages:
             return False
 
-        with idle_task_poll_lock:
-            idle_task_backoff_until = 0.0
+        message = messages[0]
+        receipt_handle = (message.get('ReceiptHandle') or '').strip()
+        payload = extract_sqs_task_body(message) or {}
+        sentence_hash = (payload.get('hash') or '').strip()
+        text = (payload.get('text') or '').strip()
+        upload_format = normalize_upload_format(payload.get('format') or AUDIO_UPLOAD_FORMAT)
+        book_hash = (payload.get('book_hash') or '').strip()
 
-        task = tasks[0] or {}
-        sentence_hash = (task.get('hash') or '').strip()
-        text = (task.get('text') or '').strip()
-        if not sentence_hash or not text:
+        if not sentence_hash or not text or not receipt_handle:
+            delete_worker_sqs_message(receipt_handle)
             coordinator_metrics['idle_tasks_failed'] += 1
-            coordinator_metrics['last_error'] = 'idle task missing hash/text'
+            coordinator_metrics['last_error'] = 'invalid_sqs_payload'
             return False
 
         coordinator_metrics['idle_tasks_claimed'] += 1
-
-        # Double-check before generation in case another node already completed.
-        existing = coordinator_request(
-            'POST',
-            '/check',
-            json_data={'hash': sentence_hash, 'text': text}
-        )
-        if existing and existing.get('status') == 'ready' and existing.get('url'):
-            coordinator_metrics['idle_tasks_completed'] += 1
-            return True
 
         output_dir = os.path.join(app.config['AUDIO_FOLDER'], 'worker_cache')
         os.makedirs(output_dir, exist_ok=True)
 
         audio_path = generate_sentence_locally(sentence_hash, text, output_dir)
         if not audio_path:
-            # One retry for transient generation failures.
             time.sleep(0.15)
             audio_path = generate_sentence_locally(sentence_hash, text, output_dir)
         if not audio_path:
             coordinator_metrics['idle_tasks_failed'] += 1
-            coordinator_metrics['last_error'] = f'idle generation failed for {sentence_hash}'
+            coordinator_metrics['last_error'] = f'generation_failed:{sentence_hash}'
             return False
 
-        uploaded_url = upload_audio_to_coordinator(sentence_hash, audio_path)
-        if uploaded_url:
-            coordinator_metrics['idle_tasks_completed'] += 1
-            return True
-
-        # Last check: another worker may have completed between our upload/complete attempts.
-        existing = coordinator_request(
-            'POST',
-            '/check',
-            json_data={'hash': sentence_hash, 'text': text}
+        uploaded_url = upload_audio_to_coordinator(
+            sentence_hash,
+            audio_path,
+            upload_format=upload_format,
+            book_hash=book_hash
         )
-        if existing and existing.get('status') == 'ready' and existing.get('url'):
-            coordinator_metrics['idle_tasks_completed'] += 1
-            return True
+        if not uploaded_url:
+            # Keep message for retry; clean local temp so disk usage does not grow.
+            audio_backend.cleanup_paths([audio_path])
+            coordinator_metrics['idle_tasks_failed'] += 1
+            coordinator_metrics['last_error'] = f'upload_failed:{sentence_hash}'
+            return False
 
-        coordinator_metrics['idle_tasks_failed'] += 1
-        coordinator_metrics['last_error'] = f'idle upload/complete failed for {sentence_hash}'
-        return False
+        if not delete_worker_sqs_message(receipt_handle):
+            coordinator_metrics['idle_tasks_failed'] += 1
+            coordinator_metrics['last_error'] = f'sqs_ack_failed:{sentence_hash}'
+            return False
+
+        coordinator_metrics['idle_tasks_completed'] += 1
+        return True
     except Exception as e:
         coordinator_metrics['idle_tasks_failed'] += 1
-        coordinator_metrics['last_error'] = f'idle task error: {str(e)}'
-        print(f"Idle coordinator task failed: {e}")
+        coordinator_metrics['last_error'] = f'sqs_worker_error:{str(e)}'
+        print(f"SQS worker task failed: {e}")
         print(traceback.format_exc())
         return False
     finally:
@@ -1068,11 +1110,8 @@ def audio_generation_worker():
             audio_generation_queue.task_done()
 
         except Empty:
-            # Queue is empty: use spare worker time for coordinator backlog.
-            # Current/nearby sentence work always wins because it is queued first.
-            did_idle_work = process_idle_coordinator_task_once()
-            if not did_idle_work:
-                time.sleep(0.1)
+            # Local sentence queue is empty.
+            time.sleep(0.1)
             continue
         except Exception as e:
             if generation_active:
@@ -1103,34 +1142,25 @@ def start_workers_if_needed():
 def should_run_idle_backfill():
     if not WORKER_IDLE_BACKFILL_ENABLED:
         return False
+    if not worker_sqs_enabled or not worker_sqs_client:
+        return False
     if not coordinator_enabled or not get_effective_coordinator_token():
         return False
-    if generation_active:
-        return False
-    try:
-        if not audio_generation_queue.empty():
-            return False
-    except Exception:
-        return False
-
-    with book_jobs_lock:
-        for job in book_jobs.values():
-            if job.get('status') in ('queued', 'running'):
-                return False
     return True
 
 
 def idle_backfill_worker_loop():
-    """Background coordinator backfill when local worker is otherwise idle."""
+    """Background SQS consumer loop for dumb worker mode."""
     while True:
         try:
             if not should_run_idle_backfill():
-                time.sleep(0.3)
+                time.sleep(0.5)
                 continue
 
             did_work = process_idle_coordinator_task_once()
             if not did_work:
-                time.sleep(COORDINATOR_IDLE_POLL_INTERVAL)
+                # receive_message already long-polls; keep additional sleep minimal.
+                time.sleep(0.1)
                 continue
             time.sleep(0.05)
         except Exception as e:
@@ -1140,15 +1170,18 @@ def idle_backfill_worker_loop():
 
 
 def ensure_idle_backfill_thread():
-    global idle_backfill_thread
+    global idle_backfill_threads
 
     if not WORKER_IDLE_BACKFILL_ENABLED:
         return
-    if idle_backfill_thread and idle_backfill_thread.is_alive():
-        return
 
-    idle_backfill_thread = threading.Thread(target=idle_backfill_worker_loop, daemon=True)
-    idle_backfill_thread.start()
+    idle_backfill_threads = [t for t in idle_backfill_threads if t.is_alive()]
+    missing = max(0, WORKER_SQS_CONCURRENCY - len(idle_backfill_threads))
+
+    for _ in range(missing):
+        thread = threading.Thread(target=idle_backfill_worker_loop, daemon=True)
+        thread.start()
+        idle_backfill_threads.append(thread)
 
 
 # -----------------------------------------------------------------------------
@@ -1407,6 +1440,11 @@ def worker_health():
         'service': 'local-audio-worker',
         'coordinator_enabled': coordinator_enabled,
         'coordinator_api_url': COORDINATOR_API_URL or None,
+        'sqs_enabled': worker_sqs_enabled,
+        'sqs_queue_url': WORKER_AUDIO_SQS_QUEUE_URL or None,
+        'sqs_wait_seconds': WORKER_AUDIO_SQS_WAIT_SECONDS,
+        'sqs_visibility_timeout': WORKER_AUDIO_SQS_VISIBILITY_TIMEOUT,
+        'sqs_concurrency': WORKER_SQS_CONCURRENCY,
         'tts_pool_requested': WORKER_TTS_POOL_REQUESTED,
         'tts_pool_size': WORKER_TTS_POOL_SIZE,
         'memory_limit_mb': WORKER_MEMORY_LIMIT_MB,
@@ -1450,8 +1488,8 @@ def worker_jobs():
         queue_size = None
 
     queue_workers_alive = sum(1 for t in audio_generation_threads if t.is_alive())
-    idle_backfill_alive = bool(idle_backfill_thread and idle_backfill_thread.is_alive())
-    alive_workers = queue_workers_alive + (1 if idle_backfill_alive else 0)
+    sqs_consumer_alive = sum(1 for t in idle_backfill_threads if t.is_alive())
+    alive_workers = queue_workers_alive + sqs_consumer_alive
 
     return jsonify({
         'status': 'ok',
@@ -1460,7 +1498,13 @@ def worker_jobs():
         'queue_size': queue_size,
         'alive_workers': alive_workers,
         'queue_workers_alive': queue_workers_alive,
-        'idle_backfill_active': idle_backfill_alive,
+        'idle_backfill_active': sqs_consumer_alive > 0,
+        'sqs_enabled': worker_sqs_enabled,
+        'sqs_consumer_active': sqs_consumer_alive > 0,
+        'sqs_consumer_threads': sqs_consumer_alive,
+        'sqs_messages_claimed': coordinator_metrics.get('idle_tasks_claimed', 0),
+        'sqs_messages_completed': coordinator_metrics.get('idle_tasks_completed', 0),
+        'sqs_messages_failed': coordinator_metrics.get('idle_tasks_failed', 0),
         'summary': {
             'total_jobs': len(snapshots),
             'queued_jobs': status_counts['queued'],
@@ -1650,6 +1694,9 @@ def coordinator_status():
     return jsonify({
         'enabled': coordinator_enabled,
         'api_url': COORDINATOR_API_URL or None,
+        'sqs_enabled': worker_sqs_enabled,
+        'sqs_queue_url': WORKER_AUDIO_SQS_QUEUE_URL or None,
+        'sqs_consumer_threads': sum(1 for t in idle_backfill_threads if t.is_alive()),
         'has_bearer_token': bool(get_effective_coordinator_token()),
         'token_source': 'runtime' if has_runtime else ('env' if has_env_token else None),
         'metrics': coordinator_metrics

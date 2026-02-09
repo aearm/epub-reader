@@ -76,7 +76,7 @@ class EPUBReaderCloud {
                 userPoolId: '',
                 clientId: '',
                 domain: '',
-                region: 'eu-west-1'
+                region: 'us-east-2'
             }
         };
     }
@@ -98,7 +98,7 @@ class EPUBReaderCloud {
             userPoolId: cognitoConfig.userPoolId,
             clientId: cognitoConfig.clientId,
             domain: cognitoConfig.domain,
-            region: cognitoConfig.region || 'eu-west-1',
+            region: cognitoConfig.region || 'us-east-2',
             redirectUri: window.location.origin,
             onAuthChange: (user) => this.onAuthChange(user)
         });
