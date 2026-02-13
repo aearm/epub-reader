@@ -1,36 +1,51 @@
+x-worker-common: &worker-common
+  build: .
+  cpus: ${WORKER_CPUS:-8}
+  mem_limit: ${WORKER_MEM_LIMIT:-16g}
+  shm_size: ${WORKER_SHM_SIZE:-2g}
+  volumes:
+    # Persist user data between restarts
+    - "${WORKER_UPLOADS_DIR:-./data/uploads}:/app/static/uploads"
+    - "${WORKER_AUDIO_DIR:-./data/audio}:/app/static/audio"
+    - "${WORKER_STATE_DIR:-./data/state}:/app/static/state"
+    - "${WORKER_LIBRARY_DIR:-./data/library}:/app/static/library"
+    - "${WORKER_MODELS_DIR:-./data/models}:/app/static/models"
+    - "${HOME}/.aws:/root/.aws:ro"
+  environment:
+    - FLASK_ENV=production
+    - COORDINATOR_API_URL=${COORDINATOR_API_URL:-https://api.reader.psybytes.com}
+    - COORDINATOR_BEARER_TOKEN=${COORDINATOR_BEARER_TOKEN:-}
+    - WORKER_SHARED_SECRET=${WORKER_SHARED_SECRET:-}
+    - WORKER_SHARED_SECRET_SECRET_ID=${WORKER_SHARED_SECRET_SECRET_ID:-}
+    - WORKER_SHARED_SECRET_PARAMETER_NAME=${WORKER_SHARED_SECRET_PARAMETER_NAME:-/epub-reader/worker-shared-secret}
+    - AWS_PROFILE=${AWS_PROFILE:-default}
+    - AWS_SDK_LOAD_CONFIG=${AWS_SDK_LOAD_CONFIG:-1}
+    - AWS_REGION=${AWS_REGION:-eu-west-1}
+    - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-eu-west-1}
+    - COORDINATOR_TIMEOUT=${COORDINATOR_TIMEOUT:-20}
+    - COORDINATOR_IDLE_POLL_INTERVAL=${COORDINATOR_IDLE_POLL_INTERVAL:-2.0}
+    - COORDINATOR_IDLE_TASK_BATCH_SIZE=${COORDINATOR_IDLE_TASK_BATCH_SIZE:-10}
+    - COORDINATOR_TOKEN_SYNC_POLL_SECONDS=${COORDINATOR_TOKEN_SYNC_POLL_SECONDS:-2.0}
+    - AUDIO_UPLOAD_FORMAT=${AUDIO_UPLOAD_FORMAT:-m4b}
+    - WORKER_TTS_POOL_SIZE=${WORKER_TTS_POOL_SIZE:-16}
+    - WORKER_TTS_HARD_CAP=${WORKER_TTS_HARD_CAP:-12}
+    - WORKER_TTS_INSTANCE_MEM_MB=${WORKER_TTS_INSTANCE_MEM_MB:-300}
+    - WORKER_BOOK_PARALLELISM=${WORKER_BOOK_PARALLELISM:-32}
+    - WORKER_UPLOAD_URL_BATCH_SIZE=${WORKER_UPLOAD_URL_BATCH_SIZE:-80}
+    - WORKER_COMPLETE_BATCH_SIZE=${WORKER_COMPLETE_BATCH_SIZE:-50}
+    - WORKER_MP3_BITRATE=${WORKER_MP3_BITRATE:-64k}
+    - WORKER_MP3_SAMPLE_RATE=${WORKER_MP3_SAMPLE_RATE:-24000}
+    - OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
+    - MKL_NUM_THREADS=${MKL_NUM_THREADS:-1}
+    - NUMEXPR_NUM_THREADS=${NUMEXPR_NUM_THREADS:-1}
+  restart: unless-stopped
+
 services:
   epub-reader:
-    build: .
+    <<: *worker-common
     ports:
-      - "5001:5001"
-    volumes:
-      # Persist user data between restarts
-      - ./data/uploads:/app/static/uploads
-      - ./data/audio:/app/static/audio
-      - ./data/state:/app/static/state
-      - ./data/library:/app/static/library
-      - ./data/models:/app/static/models
-      - ${HOME}/.aws:/root/.aws:ro
-    environment:
-      - FLASK_ENV=production
-      - COORDINATOR_API_URL=${COORDINATOR_API_URL:-https://api.reader.psybytes.com}
-      - COORDINATOR_BEARER_TOKEN=${COORDINATOR_BEARER_TOKEN:-}
-      - AWS_REGION=${AWS_REGION:-us-east-2}
-      - AWS_PROFILE=${AWS_PROFILE:-}
-      - AWS_SDK_LOAD_CONFIG=${AWS_SDK_LOAD_CONFIG:-1}
-      - AUDIO_SQS_QUEUE_URL=${AUDIO_SQS_QUEUE_URL:-}
-      - AUDIO_SQS_WAIT_SECONDS=${AUDIO_SQS_WAIT_SECONDS:-10}
-      - AUDIO_SQS_MAX_MESSAGES=${AUDIO_SQS_MAX_MESSAGES:-10}
-      - AUDIO_SQS_VISIBILITY_TIMEOUT=${AUDIO_SQS_VISIBILITY_TIMEOUT:-180}
-      - WORKER_SQS_CONCURRENCY=${WORKER_SQS_CONCURRENCY:-4}
-      - COORDINATOR_TIMEOUT=${COORDINATOR_TIMEOUT:-20}
-      - COORDINATOR_IDLE_POLL_INTERVAL=${COORDINATOR_IDLE_POLL_INTERVAL:-2.0}
-      - AUDIO_UPLOAD_FORMAT=${AUDIO_UPLOAD_FORMAT:-m4b}
-      - WORKER_TTS_POOL_SIZE=${WORKER_TTS_POOL_SIZE:-32}
-      - WORKER_TTS_HARD_CAP=${WORKER_TTS_HARD_CAP:-12}
-      - WORKER_BOOK_PARALLELISM=${WORKER_BOOK_PARALLELISM:-32}
-      - WORKER_UPLOAD_URL_BATCH_SIZE=${WORKER_UPLOAD_URL_BATCH_SIZE:-80}
-      - WORKER_COMPLETE_BATCH_SIZE=${WORKER_COMPLETE_BATCH_SIZE:-50}
-      - WORKER_MP3_BITRATE=${WORKER_MP3_BITRATE:-64k}
-      - WORKER_MP3_SAMPLE_RATE=${WORKER_MP3_SAMPLE_RATE:-24000}
-    restart: unless-stopped
+      - "${WORKER_HOST_PORT:-5001}:5001"
+
+  epub-reader-worker:
+    <<: *worker-common
+    profiles: ["workers"]

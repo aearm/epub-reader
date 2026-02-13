@@ -11,19 +11,22 @@ Manages distributed audio generation:
 import os
 import sqlite3
 import hashlib
+import hmac
 import time
 import json
-import hmac
-import re
+import random
+import string
+import uuid
 import boto3
 import threading
 import io
 import wave
 from array import array
+from datetime import datetime, timezone
+from botocore.config import Config
 from flask import Flask, request, jsonify, g, Response, stream_with_context
 from flask_cors import CORS
 from functools import wraps
-from botocore.config import Config
 from jose import jwt, JWTError
 import requests
 from urllib.parse import unquote, urlparse
@@ -37,7 +40,7 @@ CORS(app, origins=[
 
 # Configuration from environment
 AUDIO_BUCKET = os.environ.get('AUDIO_BUCKET', 'epub-reader-audio')
-AWS_REGION = os.environ.get('AWS_REGION', 'us-east-2')
+AWS_REGION = os.environ.get('AWS_REGION', 'eu-west-1')
 COGNITO_POOL_ID = os.environ.get('COGNITO_POOL_ID', '')
 COGNITO_CLIENT_ID = os.environ.get('COGNITO_CLIENT_ID', '')
 DATABASE_PATH = os.environ.get('DATABASE_PATH', '/opt/epub-reader/coordinator.db')
@@ -57,7 +60,6 @@ MAX_GENERATE_SENTENCES = int(os.environ.get('MAX_GENERATE_SENTENCES', '6000'))
 MAX_MANIFEST_ITEMS = int(os.environ.get('MAX_MANIFEST_ITEMS', '10000'))
 AUDIO_SQS_QUEUE_URL = (os.environ.get('AUDIO_SQS_QUEUE_URL') or '').strip()
 AUDIO_SQS_DLQ_URL = (os.environ.get('AUDIO_SQS_DLQ_URL') or '').strip()
-AUDIO_SQS_REGION = (os.environ.get('AUDIO_SQS_REGION') or '').strip()
 AUDIO_SQS_WAIT_SECONDS = max(0, min(int(os.environ.get('AUDIO_SQS_WAIT_SECONDS', '2')), 20))
 AUDIO_SQS_MAX_MESSAGES = max(1, min(int(os.environ.get('AUDIO_SQS_MAX_MESSAGES', '10')), 10))
 AUDIO_SQS_VISIBILITY_TIMEOUT = max(30, int(os.environ.get('AUDIO_SQS_VISIBILITY_TIMEOUT', '180')))
@@ -67,37 +69,82 @@ AUDIO_GENERATING_STALE_SECONDS = max(
     int(os.environ.get('AUDIO_GENERATING_STALE_SECONDS', str(AUDIO_SQS_VISIBILITY_TIMEOUT)))
 )
 GENERATE_AUDIO_DB_BATCH_SIZE = max(50, int(os.environ.get('GENERATE_AUDIO_DB_BATCH_SIZE', '250')))
-OPENAI_API_KEY = (os.environ.get('OPENAI_API_KEY') or '').strip()
-OPENAI_MODEL = (os.environ.get('OPENAI_MODEL') or 'gpt-4o-mini').strip()
-OPENAI_API_BASE = (os.environ.get('OPENAI_API_BASE') or 'https://api.openai.com/v1').rstrip('/')
-BOOK_CHAT_HISTORY_LIMIT = max(6, int(os.environ.get('BOOK_CHAT_HISTORY_LIMIT', '80')))
-BOOK_CHAT_CONTEXT_LIMIT = max(4, int(os.environ.get('BOOK_CHAT_CONTEXT_LIMIT', '24')))
-BOOK_CHAT_MAX_MESSAGE_CHARS = max(200, int(os.environ.get('BOOK_CHAT_MAX_MESSAGE_CHARS', '5000')))
-BOOK_CHAT_TIMEOUT_SECONDS = max(10, int(os.environ.get('BOOK_CHAT_TIMEOUT_SECONDS', '45')))
-WORKER_SHARED_SECRET = (os.environ.get('WORKER_SHARED_SECRET') or '').strip()
 
 
-def _infer_sqs_region_from_url(queue_url):
-    if not queue_url:
-        return None
-    match = re.match(r'^https://sqs\.([a-z0-9-]+)\.amazonaws\.com/', queue_url.strip())
-    if match:
-        return match.group(1)
-    return None
+def _extract_worker_shared_secret(value):
+    if not isinstance(value, str):
+        return ''
+    text = value.strip()
+    if not text:
+        return ''
+    if text.startswith('{') and text.endswith('}'):
+        try:
+            payload = json.loads(text)
+            if isinstance(payload, dict):
+                for key in ('worker_shared_secret', 'WORKER_SHARED_SECRET', 'secret'):
+                    candidate = payload.get(key)
+                    if isinstance(candidate, str) and candidate.strip():
+                        return candidate.strip()
+        except Exception:
+            return text
+    return text
 
 
-if not AUDIO_SQS_REGION:
-    AUDIO_SQS_REGION = _infer_sqs_region_from_url(AUDIO_SQS_QUEUE_URL) or AWS_REGION
+def load_worker_shared_secret():
+    env_secret = _extract_worker_shared_secret(os.environ.get('WORKER_SHARED_SECRET') or '')
+    if env_secret:
+        return env_secret, 'env'
+
+    secret_ids = [
+        (os.environ.get('WORKER_SHARED_SECRET_SECRET_ID') or '').strip(),
+    ]
+    parameter_names = [
+        (os.environ.get('WORKER_SHARED_SECRET_PARAMETER_NAME') or '').strip(),
+        '/epub-reader/worker-shared-secret',
+    ]
+
+    try:
+        session = boto3.session.Session(region_name=AWS_REGION or None)
+    except Exception:
+        return '', None
+    boto_config = Config(connect_timeout=2, read_timeout=2, retries={'max_attempts': 1})
+
+    for secret_id in [s for s in secret_ids if s]:
+        try:
+            sm = session.client('secretsmanager', config=boto_config)
+            response = sm.get_secret_value(SecretId=secret_id)
+            secret = _extract_worker_shared_secret(response.get('SecretString', ''))
+            if secret:
+                return secret, f'secretsmanager:{secret_id}'
+        except Exception:
+            continue
+
+    for name in [n for n in parameter_names if n]:
+        try:
+            ssm = session.client('ssm', config=boto_config)
+            response = ssm.get_parameter(Name=name, WithDecryption=True)
+            secret = _extract_worker_shared_secret(response.get('Parameter', {}).get('Value', ''))
+            if secret:
+                return secret, f'ssm:{name}'
+        except Exception:
+            continue
+
+    return '', None
+
+
+WORKER_SHARED_SECRET, WORKER_SHARED_SECRET_SOURCE = load_worker_shared_secret()
+if not WORKER_SHARED_SECRET:
+    print("WARNING: WORKER_SHARED_SECRET is empty. Worker service-auth will be disabled until set.")
 
 # S3 client
-# Force regional virtual-host URLs for presigned requests so browser CORS
-# preflight does not hit global-endpoint redirects.
+# Force regional, virtual-host style presigned URLs with SigV4 to avoid
+# browser CORS/preflight failures caused by global S3 endpoint redirects.
 s3_client = boto3.client(
     's3',
     region_name=AWS_REGION,
     config=Config(signature_version='s3v4', s3={'addressing_style': 'virtual'})
 )
-sqs_client = boto3.client('sqs', region_name=AUDIO_SQS_REGION) if AUDIO_SQS_QUEUE_URL else None
+sqs_client = boto3.client('sqs', region_name=AWS_REGION) if AUDIO_SQS_QUEUE_URL else None
 
 # Cognito JWKS URL
 COGNITO_JWKS_URL = f"https://cognito-idp.{AWS_REGION}.amazonaws.com/{COGNITO_POOL_ID}/.well-known/jwks.json"
@@ -157,7 +204,6 @@ def init_db():
         CREATE TABLE IF NOT EXISTS user_books (
             user_id TEXT NOT NULL,
             book_id TEXT NOT NULL,
-            book_hash TEXT,
             title TEXT NOT NULL,
             author TEXT DEFAULT '',
             epub_key TEXT NOT NULL,
@@ -189,7 +235,7 @@ def init_db():
             status TEXT DEFAULT 'pending',
             s3_key TEXT,
             s3_url TEXT,
-            audio_format TEXT DEFAULT 'm4b',
+            audio_format TEXT DEFAULT 'wav',
             error TEXT,
             created_at REAL NOT NULL,
             updated_at REAL NOT NULL,
@@ -198,13 +244,88 @@ def init_db():
         )
     ''')
     db.execute('''
-        CREATE TABLE IF NOT EXISTS book_chat_messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+        CREATE TABLE IF NOT EXISTS clubs (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            description TEXT,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            owner_user_id TEXT NOT NULL,
+            invite_code TEXT NOT NULL UNIQUE,
+            join_policy TEXT NOT NULL DEFAULT 'link',
+            active_book_id TEXT,
+            plan_json TEXT,
+            pinned_post_id TEXT
+        )
+    ''')
+    db.execute('''
+        CREATE TABLE IF NOT EXISTS club_members (
+            club_id TEXT NOT NULL,
             user_id TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            avatar_color TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'member',
+            joined_at REAL NOT NULL,
+            hide_progress INTEGER NOT NULL DEFAULT 0,
+            progress_by_book_json TEXT NOT NULL DEFAULT '{}',
+            notifications_json TEXT NOT NULL DEFAULT '{}',
+            PRIMARY KEY(club_id, user_id)
+        )
+    ''')
+    db.execute('''
+        CREATE TABLE IF NOT EXISTS club_posts (
+            id TEXT PRIMARY KEY,
+            club_id TEXT NOT NULL,
+            author_user_id TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            text TEXT NOT NULL,
+            spoiler_boundary_json TEXT,
+            reactions_json TEXT NOT NULL DEFAULT '{}',
+            reply_to_post_id TEXT,
+            mentions_json TEXT,
+            attached_passage_thread_id TEXT
+        )
+    ''')
+    db.execute('''
+        CREATE TABLE IF NOT EXISTS club_threads (
+            id TEXT PRIMARY KEY,
+            club_id TEXT NOT NULL,
             book_id TEXT NOT NULL,
-            role TEXT NOT NULL,
-            content TEXT NOT NULL,
-            created_at REAL NOT NULL
+            chapter_id TEXT NOT NULL,
+            sentence_start INTEGER NOT NULL DEFAULT 0,
+            sentence_end INTEGER NOT NULL DEFAULT 0,
+            created_at REAL NOT NULL,
+            created_by_user_id TEXT NOT NULL,
+            title TEXT,
+            spoiler_boundary_json TEXT
+        )
+    ''')
+    db.execute('''
+        CREATE TABLE IF NOT EXISTS club_thread_messages (
+            id TEXT PRIMARY KEY,
+            thread_id TEXT NOT NULL,
+            author_user_id TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            text TEXT NOT NULL,
+            reactions_json TEXT NOT NULL DEFAULT '{}'
+        )
+    ''')
+    db.execute('''
+        CREATE TABLE IF NOT EXISTS club_join_requests (
+            club_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            requested_at REAL NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            PRIMARY KEY(club_id, user_id)
+        )
+    ''')
+    db.execute('''
+        CREATE TABLE IF NOT EXISTS club_spoiler_preferences (
+            club_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            preference TEXT NOT NULL,
+            updated_at REAL NOT NULL,
+            PRIMARY KEY(club_id, user_id)
         )
     ''')
     db.execute('CREATE INDEX IF NOT EXISTS idx_status ON audio_index(status)')
@@ -212,7 +333,11 @@ def init_db():
     db.execute('CREATE INDEX IF NOT EXISTS idx_user_books_user_last_opened ON user_books(user_id, last_opened DESC)')
     db.execute('CREATE INDEX IF NOT EXISTS idx_book_audio_owner_status ON book_audio(user_id, book_id, status)')
     db.execute('CREATE INDEX IF NOT EXISTS idx_book_audio_hash ON book_audio(hash)')
-    db.execute('CREATE INDEX IF NOT EXISTS idx_book_chat_owner_book_id ON book_chat_messages(user_id, book_id, id)')
+    db.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_clubs_invite_code ON clubs(invite_code)')
+    db.execute('CREATE INDEX IF NOT EXISTS idx_club_members_user ON club_members(user_id)')
+    db.execute('CREATE INDEX IF NOT EXISTS idx_club_posts_club_created ON club_posts(club_id, created_at DESC)')
+    db.execute('CREATE INDEX IF NOT EXISTS idx_club_threads_club_book ON club_threads(club_id, book_id)')
+    db.execute('CREATE INDEX IF NOT EXISTS idx_club_thread_messages_thread_created ON club_thread_messages(thread_id, created_at ASC)')
 
     # Migrate older databases in place.
     existing_audio_cols = {
@@ -228,14 +353,6 @@ def init_db():
         db.execute("ALTER TABLE audio_index ADD COLUMN attempt_count INTEGER DEFAULT 0")
     if 'error' not in existing_audio_cols:
         db.execute("ALTER TABLE audio_index ADD COLUMN error TEXT")
-
-    existing_user_books_cols = {
-        row[1] for row in db.execute('PRAGMA table_info(user_books)').fetchall()
-    }
-    if 'book_hash' not in existing_user_books_cols:
-        db.execute("ALTER TABLE user_books ADD COLUMN book_hash TEXT")
-        db.execute("UPDATE user_books SET book_hash = book_id WHERE book_hash IS NULL OR book_hash = ''")
-    db.execute('CREATE INDEX IF NOT EXISTS idx_user_books_user_book_hash ON user_books(user_id, book_hash)')
 
     db.commit()
     db.close()
@@ -289,14 +406,29 @@ def verify_token(token):
         if not key:
             return None
 
-        # Verify token
+        # Verify signature/issuer first, then validate client binding based on token_use.
         payload = jwt.decode(
             token,
             key,
             algorithms=['RS256'],
-            audience=COGNITO_CLIENT_ID,
-            issuer=f"https://cognito-idp.{AWS_REGION}.amazonaws.com/{COGNITO_POOL_ID}"
+            issuer=f"https://cognito-idp.{AWS_REGION}.amazonaws.com/{COGNITO_POOL_ID}",
+            options={'verify_aud': False}
         )
+
+        if COGNITO_CLIENT_ID:
+            token_use = (payload.get('token_use') or '').strip().lower()
+            aud = (payload.get('aud') or '').strip()
+            client_id = (payload.get('client_id') or '').strip()
+
+            if token_use == 'access':
+                if client_id != COGNITO_CLIENT_ID:
+                    return None
+            elif token_use == 'id':
+                if aud != COGNITO_CLIENT_ID:
+                    return None
+            elif aud != COGNITO_CLIENT_ID and client_id != COGNITO_CLIENT_ID:
+                # Defensive fallback for tokens without token_use claim.
+                return None
 
         return payload
     except JWTError as e:
@@ -304,90 +436,50 @@ def verify_token(token):
         return None
 
 
-def _extract_worker_secret():
-    direct = (request.headers.get('X-Worker-Secret') or '').strip()
-    if direct:
-        return direct
-
-    auth_header = (request.headers.get('Authorization') or '').strip()
-    if auth_header.startswith('Worker '):
-        return auth_header[7:].strip()
-    if auth_header.startswith('Bearer worker:'):
-        return auth_header[len('Bearer worker:'):].strip()
-    return ''
-
-
-def _is_worker_authenticated():
-    if not WORKER_SHARED_SECRET:
-        return False
-    provided = _extract_worker_secret()
-    return bool(provided and hmac.compare_digest(provided, WORKER_SHARED_SECRET))
-
-
-def _set_worker_principal():
-    g.user = {
-        'sub': 'cloud-worker',
-        'username': 'cloud-worker'
-    }
-    g.auth_source = 'worker'
-
-
 def require_auth(f):
     """Decorator to require valid Cognito token."""
     @wraps(f)
     def decorated(*args, **kwargs):
-        auth_header = (request.headers.get('Authorization') or '').strip()
+        auth_header = request.headers.get('Authorization', '')
 
         if not auth_header.startswith('Bearer '):
             return jsonify({'error': 'Missing or invalid Authorization header'}), 401
 
-        token = auth_header[7:].strip()  # Remove 'Bearer ' prefix
+        token = auth_header[7:]  # Remove 'Bearer ' prefix
         payload = verify_token(token)
 
         if not payload:
             return jsonify({'error': 'Invalid or expired token'}), 401
 
         g.user = payload
-        g.auth_source = 'user'
         return f(*args, **kwargs)
 
     return decorated
 
 
-def require_auth_or_worker(f):
-    """Decorator to allow Cognito user auth or internal worker shared-secret auth."""
+def require_worker_or_auth(f):
+    """
+    Allow either:
+    - user JWT (Authorization: Bearer ...)
+    - trusted worker shared secret (X-Worker-Secret)
+    """
     @wraps(f)
     def decorated(*args, **kwargs):
-        auth_header = (request.headers.get('Authorization') or '').strip()
-
-        if auth_header.startswith('Bearer '):
-            token = auth_header[7:].strip()
-            payload = verify_token(token)
-            if payload:
-                g.user = payload
-                g.auth_source = 'user'
-                return f(*args, **kwargs)
-
-        if _is_worker_authenticated():
-            _set_worker_principal()
+        worker_secret = (request.headers.get('X-Worker-Secret') or '').strip()
+        if WORKER_SHARED_SECRET and worker_secret and hmac.compare_digest(worker_secret, WORKER_SHARED_SECRET):
+            g.user = {'sub': 'worker-service', 'role': 'worker'}
             return f(*args, **kwargs)
 
-        if auth_header.startswith('Bearer '):
+        auth_header = request.headers.get('Authorization', '')
+        if not auth_header.startswith('Bearer '):
+            return jsonify({'error': 'Missing or invalid Authorization header'}), 401
+
+        token = auth_header[7:]
+        payload = verify_token(token)
+        if not payload:
             return jsonify({'error': 'Invalid or expired token'}), 401
-        if _extract_worker_secret():
-            return jsonify({'error': 'Invalid worker credentials'}), 401
-        return jsonify({'error': 'Missing or invalid Authorization header'}), 401
 
-    return decorated
-
-
-def require_worker_auth(f):
-    """Decorator to require internal worker shared-secret auth."""
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        if not _is_worker_authenticated():
-            return jsonify({'error': 'Invalid worker credentials'}), 401
-        _set_worker_principal()
+        g.user = payload
         return f(*args, **kwargs)
 
     return decorated
@@ -408,22 +500,41 @@ def normalize_book_id(raw_book_id):
     return cleaned[:128]
 
 
-def normalize_book_hash(raw_book_hash, fallback_book_id=None):
-    candidate = normalize_book_id(raw_book_hash)
-    if candidate:
-        return candidate
-    fallback = normalize_book_id(fallback_book_id)
-    if fallback:
-        return fallback
-    return None
-
-
 def get_current_user_id():
     return g.user.get('sub', 'anonymous')
 
 
 def build_s3_public_url(key):
     return f"https://{AUDIO_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{key}"
+
+
+def claim_pending_tasks_from_db(db, user_id: str, limit: int):
+    """Claim pending rows directly from DB (fallback when SQS is unavailable/empty)."""
+    rows = db.execute(
+        '''SELECT hash, text FROM audio_index
+           WHERE status = 'pending' AND (claimed_by IS NULL OR claimed_at < ?)
+           ORDER BY created_at ASC
+           LIMIT ?''',
+        (time.time() - 300, limit)
+    ).fetchall()
+
+    tasks = []
+    now = time.time()
+    for row in rows:
+        db.execute(
+            '''
+            UPDATE audio_index
+            SET claimed_by = ?, claimed_at = ?, status = 'generating', updated_at = ?
+            WHERE hash = ?
+            ''',
+            (user_id, now, now, row['hash'])
+        )
+        tasks.append({
+            'hash': row['hash'],
+            'text': row['text']
+        })
+
+    return tasks
 
 
 def normalize_audio_format(value, default='wav'):
@@ -447,39 +558,6 @@ def infer_audio_meta_from_url(s3_url):
     return key, 'wav'
 
 
-def get_book_manifest_key(book_hash):
-    normalized = normalize_book_hash(book_hash)
-    if not normalized:
-        return None
-    return f"books/{normalized}/manifest.json"
-
-
-def check_book_manifest_exists(book_hash):
-    key = get_book_manifest_key(book_hash)
-    if not key:
-        return False
-    try:
-        s3_client.head_object(Bucket=AUDIO_BUCKET, Key=key)
-        return True
-    except Exception:
-        return False
-
-
-def load_book_manifest(book_hash):
-    key = get_book_manifest_key(book_hash)
-    if not key:
-        return None
-    try:
-        obj = s3_client.get_object(Bucket=AUDIO_BUCKET, Key=key)
-        body = obj['Body'].read()
-        payload = json.loads(body.decode('utf-8'))
-        if isinstance(payload, dict):
-            return payload
-    except Exception:
-        return None
-    return None
-
-
 def parse_int(value, default=0):
     try:
         return int(value)
@@ -494,168 +572,250 @@ def parse_float(value, default=0.0):
         return default
 
 
-def truncate_text(value, limit):
-    if value is None:
-        return ''
-    text = str(value).strip()
-    if len(text) <= limit:
-        return text
-    return text[:limit]
+def now_iso(ts=None):
+    value = time.time() if ts is None else parse_float(ts, time.time())
+    return datetime.fromtimestamp(value, tz=timezone.utc).isoformat()
 
 
-def resolve_book_cover_url(row):
-    if not row:
+def safe_json_load(value, default):
+    if value is None or value == '':
+        return default
+    try:
+        parsed = json.loads(value)
+    except Exception:
+        return default
+    return parsed if parsed is not None else default
+
+
+def _default_member_notifications():
+    return {
+        'replies': True,
+        'mentions': True,
+        'milestonePosts': True,
+        'digest': 'daily',
+    }
+
+
+def generate_invite_code(length=8):
+    alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+    return ''.join(random.choice(alphabet) for _ in range(max(4, length)))
+
+
+def build_avatar_color(seed):
+    digest = hashlib.sha256((seed or 'reader').encode('utf-8')).hexdigest()
+    hue = int(digest[:8], 16) % 360
+    return f'hsl({hue} 45% 38%)'
+
+
+def current_user_profile():
+    user_id = get_current_user_id()
+    email = (g.user.get('email') or '').strip()
+    display_name = (g.user.get('name') or email or 'Reader').strip()
+    avatar_color = build_avatar_color(email or user_id)
+    return {
+        'user_id': user_id,
+        'email': email,
+        'display_name': display_name,
+        'avatar_color': avatar_color,
+    }
+
+
+def _normalize_progress_map(value):
+    progress = value if isinstance(value, dict) else {}
+    normalized = {}
+    for book_id, item in progress.items():
+        if not isinstance(item, dict):
+            continue
+        chapter_id = str(item.get('chapterId') or item.get('chapter_id') or '').strip()
+        sentence_index = max(0, parse_int(item.get('sentenceIndex') or item.get('sentence_index'), 0))
+        if not chapter_id:
+            continue
+        normalized[str(book_id)] = {
+            'chapterId': chapter_id,
+            'sentenceIndex': sentence_index,
+        }
+    return normalized
+
+
+def _normalize_notifications(value):
+    defaults = _default_member_notifications()
+    incoming = value if isinstance(value, dict) else {}
+    digest = str(incoming.get('digest') or defaults['digest']).strip().lower()
+    if digest not in ('off', 'daily', 'weekly'):
+        digest = defaults['digest']
+    return {
+        'replies': bool(incoming.get('replies', defaults['replies'])),
+        'mentions': bool(incoming.get('mentions', defaults['mentions'])),
+        'milestonePosts': bool(incoming.get('milestonePosts', defaults['milestonePosts'])),
+        'digest': digest,
+    }
+
+
+def serialize_club_member(row):
+    progress = _normalize_progress_map(safe_json_load(row['progress_by_book_json'], {}))
+    notifications = _normalize_notifications(safe_json_load(row['notifications_json'], {}))
+    return {
+        'userId': row['user_id'],
+        'displayName': row['display_name'],
+        'avatarColor': row['avatar_color'],
+        'role': row['role'] if row['role'] in ('owner', 'member') else 'member',
+        'joinedAt': now_iso(row['joined_at']),
+        'progressByBook': progress,
+        'notifications': notifications,
+        'hideProgress': bool(row['hide_progress']),
+    }
+
+
+def serialize_club_row(db, row, include_members=True):
+    members = []
+    if include_members:
+        member_rows = db.execute(
+            '''
+            SELECT *
+            FROM club_members
+            WHERE club_id = ?
+            ORDER BY CASE role WHEN 'owner' THEN 0 ELSE 1 END, joined_at ASC
+            ''',
+            (row['id'],)
+        ).fetchall()
+        members = [serialize_club_member(member) for member in member_rows]
+
+    plan = safe_json_load(row['plan_json'], None)
+    if plan is not None and not isinstance(plan, dict):
+        plan = None
+
+    return {
+        'id': row['id'],
+        'name': row['name'],
+        'description': row['description'],
+        'createdAt': now_iso(row['created_at']),
+        'ownerUserId': row['owner_user_id'],
+        'inviteCode': row['invite_code'],
+        'joinPolicy': row['join_policy'] if row['join_policy'] in ('link', 'approval') else 'link',
+        'members': members,
+        'activeBookId': row['active_book_id'],
+        'plan': plan,
+        'pinnedPostId': row['pinned_post_id'],
+    }
+
+
+def _default_spoiler_boundary(thread_or_post):
+    if not isinstance(thread_or_post, dict):
         return None
-
-    cover_key = (row['cover_key'] or '').strip() if 'cover_key' in row.keys() else ''
-    cover_url = (row['cover_url'] or '').strip() if 'cover_url' in row.keys() else ''
-
-    if cover_key:
-        try:
-            return s3_client.generate_presigned_url(
-                'get_object',
-                Params={
-                    'Bucket': AUDIO_BUCKET,
-                    'Key': cover_key
-                },
-                ExpiresIn=3600
-            )
-        except Exception:
-            pass
-
-    return cover_url or None
-
-
-def get_user_book_title(db, user_id, book_id):
-    row = db.execute(
-        'SELECT title FROM user_books WHERE user_id = ? AND book_id = ?',
-        (user_id, book_id)
-    ).fetchone()
-    if not row:
+    chapter_id = str(thread_or_post.get('chapterId') or thread_or_post.get('chapter_id') or '').strip()
+    if not chapter_id:
         return None
-    return (row['title'] or '').strip() or None
+    sentence_index = max(0, parse_int(thread_or_post.get('sentenceIndex') or thread_or_post.get('sentence_index'), 0))
+    return {'chapterId': chapter_id, 'sentenceIndex': sentence_index}
 
 
-def get_user_book_hash(db, user_id, book_id):
-    row = db.execute(
-        'SELECT book_hash FROM user_books WHERE user_id = ? AND book_id = ?',
-        (user_id, book_id)
+def serialize_club_post_row(row):
+    spoiler_boundary = _default_spoiler_boundary(safe_json_load(row['spoiler_boundary_json'], {}))
+    reactions_raw = safe_json_load(row['reactions_json'], {})
+    reactions = {}
+    if isinstance(reactions_raw, dict):
+        for emoji, user_ids in reactions_raw.items():
+            if not isinstance(emoji, str):
+                continue
+            if isinstance(user_ids, list):
+                reactions[emoji] = [str(uid) for uid in user_ids if uid]
+    mentions_raw = safe_json_load(row['mentions_json'], None)
+    mentions = [str(x) for x in mentions_raw if x] if isinstance(mentions_raw, list) else None
+    return {
+        'id': row['id'],
+        'clubId': row['club_id'],
+        'authorUserId': row['author_user_id'],
+        'createdAt': now_iso(row['created_at']),
+        'text': row['text'] or '',
+        'spoilerBoundary': spoiler_boundary,
+        'reactions': reactions,
+        'replyToPostId': row['reply_to_post_id'],
+        'mentions': mentions,
+        'attachedPassageThreadId': row['attached_passage_thread_id'],
+    }
+
+
+def serialize_club_message_row(row):
+    reactions_raw = safe_json_load(row['reactions_json'], {})
+    reactions = {}
+    if isinstance(reactions_raw, dict):
+        for emoji, user_ids in reactions_raw.items():
+            if not isinstance(emoji, str):
+                continue
+            if isinstance(user_ids, list):
+                reactions[emoji] = [str(uid) for uid in user_ids if uid]
+    return {
+        'id': row['id'],
+        'authorUserId': row['author_user_id'],
+        'createdAt': now_iso(row['created_at']),
+        'text': row['text'] or '',
+        'reactions': reactions,
+    }
+
+
+def serialize_club_thread_row(db, row, include_messages=True):
+    spoiler_boundary = _default_spoiler_boundary(safe_json_load(row['spoiler_boundary_json'], {})) or {
+        'chapterId': row['chapter_id'],
+        'sentenceIndex': max(0, parse_int(row['sentence_start'], 0)),
+    }
+    messages = []
+    if include_messages:
+        message_rows = db.execute(
+            '''
+            SELECT *
+            FROM club_thread_messages
+            WHERE thread_id = ?
+            ORDER BY created_at ASC
+            ''',
+            (row['id'],)
+        ).fetchall()
+        messages = [serialize_club_message_row(message_row) for message_row in message_rows]
+
+    return {
+        'id': row['id'],
+        'clubId': row['club_id'],
+        'bookId': row['book_id'],
+        'chapterId': row['chapter_id'],
+        'sentenceRange': {
+            'start': max(0, parse_int(row['sentence_start'], 0)),
+            'end': max(0, parse_int(row['sentence_end'], 0)),
+        },
+        'createdAt': now_iso(row['created_at']),
+        'createdByUserId': row['created_by_user_id'],
+        'title': row['title'],
+        'spoilerBoundary': spoiler_boundary,
+        'messages': messages,
+    }
+
+
+def get_club_with_role(db, club_id, user_id):
+    return db.execute(
+        '''
+        SELECT c.*, m.role AS member_role
+        FROM clubs c
+        LEFT JOIN club_members m ON m.club_id = c.id AND m.user_id = ?
+        WHERE c.id = ?
+        ''',
+        (user_id, club_id)
     ).fetchone()
+
+
+def ensure_member_access(db, club_id, user_id):
+    row = get_club_with_role(db, club_id, user_id)
     if not row:
-        return normalize_book_hash(book_id)
-    return normalize_book_hash(row['book_hash'], fallback_book_id=book_id)
+        return None, (jsonify({'error': 'Club not found'}), 404)
+    if not row['member_role']:
+        return None, (jsonify({'error': 'Forbidden'}), 403)
+    return row, None
 
 
-def get_book_chat_messages(db, user_id, book_id, limit=80):
-    limit = max(1, min(int(limit or 80), 200))
-    rows = db.execute(
-        '''
-        SELECT id, role, content, created_at
-        FROM book_chat_messages
-        WHERE user_id = ? AND book_id = ?
-        ORDER BY id DESC
-        LIMIT ?
-        ''',
-        (user_id, book_id, limit)
-    ).fetchall()
-    rows = list(reversed(rows))
-    return [{
-        'id': int(row['id']),
-        'role': row['role'],
-        'content': row['content'],
-        'created_at': float(row['created_at'] or 0.0),
-    } for row in rows]
-
-
-def store_book_chat_message(db, user_id, book_id, role, content):
-    now = time.time()
-    db.execute(
-        '''
-        INSERT INTO book_chat_messages (user_id, book_id, role, content, created_at)
-        VALUES (?, ?, ?, ?, ?)
-        ''',
-        (user_id, book_id, role, truncate_text(content, BOOK_CHAT_MAX_MESSAGE_CHARS), now)
-    )
-    return now
-
-
-def trim_book_chat_messages(db, user_id, book_id, keep_count):
-    keep_count = max(20, int(keep_count or 20))
-    db.execute(
-        '''
-        DELETE FROM book_chat_messages
-        WHERE user_id = ?
-          AND book_id = ?
-          AND id NOT IN (
-              SELECT id
-              FROM book_chat_messages
-              WHERE user_id = ? AND book_id = ?
-              ORDER BY id DESC
-              LIMIT ?
-          )
-        ''',
-        (user_id, book_id, user_id, book_id, keep_count)
-    )
-
-
-def build_chat_user_message(raw_message, context):
-    message = truncate_text(raw_message, BOOK_CHAT_MAX_MESSAGE_CHARS)
-    if not message:
-        return ''
-
-    if not isinstance(context, dict):
-        return message
-
-    quote = truncate_text(context.get('quote') or '', 2000)
-    chapter_id = truncate_text(context.get('chapter_id') or '', 128)
-    sentence_index = parse_int(context.get('sentence_index'), -1)
-
-    context_lines = []
-    if chapter_id:
-        context_lines.append(f'Chapter: {chapter_id}')
-    if sentence_index >= 0:
-        context_lines.append(f'Sentence index: {sentence_index}')
-    if quote:
-        context_lines.append(f'Passage: {quote}')
-
-    if not context_lines:
-        return message
-
-    return (
-        f'Context:\n' + '\n'.join(context_lines) +
-        f'\n\nUser request:\n{message}'
-    )
-
-
-def call_openai_chat(messages):
-    if not OPENAI_API_KEY:
-        raise RuntimeError('OPENAI_API_KEY is not configured on coordinator.')
-
-    response = requests.post(
-        f'{OPENAI_API_BASE}/chat/completions',
-        headers={
-            'Authorization': f'Bearer {OPENAI_API_KEY}',
-            'Content-Type': 'application/json',
-        },
-        json={
-            'model': OPENAI_MODEL,
-            'messages': messages,
-            'temperature': 0.2,
-        },
-        timeout=BOOK_CHAT_TIMEOUT_SECONDS
-    )
-
-    if response.status_code >= 400:
-        body = response.text[:800] if response.text else ''
-        raise RuntimeError(f'OpenAI request failed ({response.status_code}) {body}'.strip())
-
-    payload = response.json()
-    reply = (
-        ((payload.get('choices') or [{}])[0].get('message') or {}).get('content') or ''
-    ).strip()
-    if not reply:
-        raise RuntimeError('OpenAI returned an empty response.')
-    return reply
+def ensure_owner_access(db, club_id, user_id):
+    row, error_response = ensure_member_access(db, club_id, user_id)
+    if error_response:
+        return None, error_response
+    if row['owner_user_id'] != user_id:
+        return None, (jsonify({'error': 'Owner access required'}), 403)
+    return row, None
 
 
 def sqs_enabled():
@@ -666,101 +826,62 @@ def sqs_is_fifo_queue():
     return AUDIO_SQS_QUEUE_URL.lower().endswith('.fifo')
 
 
-def _normalize_task_payload(sentence_hash, text, book_hash=None, sentence_id=None, sentence_index=None, audio_format='m4b'):
+def _build_sqs_payload(sentence_hash, text):
     payload = {
         'hash': (sentence_hash or '').strip(),
         'text': (text or '').strip(),
         'enqueued_at': time.time(),
-        'format': normalize_audio_format(audio_format or 'm4b')[0]
     }
-    normalized_book_hash = normalize_book_hash(book_hash)
-    if normalized_book_hash:
-        payload['book_hash'] = normalized_book_hash
-    if sentence_id:
-        payload['sentence_id'] = str(sentence_id).strip()
-    if sentence_index is not None:
-        payload['sentence_index'] = max(0, parse_int(sentence_index, 0))
+    if not payload['hash'] or not payload['text']:
+        return None
     return payload
 
 
-def enqueue_audio_task(sentence_hash, text, book_hash=None, sentence_id=None, sentence_index=None, audio_format='m4b'):
+def enqueue_audio_tasks_batch(items):
     """
-    Push one sentence task to SQS. Returns True when enqueue request succeeds.
-    """
-    if not sqs_enabled():
-        return False
-
-    payload = _normalize_task_payload(
-        sentence_hash=sentence_hash,
-        text=text,
-        book_hash=book_hash,
-        sentence_id=sentence_id,
-        sentence_index=sentence_index,
-        audio_format=audio_format
-    )
-    if not payload['hash'] or not payload['text']:
-        return False
-
-    args = {
-        'QueueUrl': AUDIO_SQS_QUEUE_URL,
-        'MessageBody': json.dumps(payload, separators=(',', ':')),
-    }
-    if sqs_is_fifo_queue():
-        group_hash = payload.get('book_hash') or 'audio-generation'
-        args['MessageGroupId'] = group_hash
-        args['MessageDeduplicationId'] = f"{group_hash}:{payload['hash']}"
-
-    try:
-        sqs_client.send_message(**args)
-        return True
-    except Exception as e:
-        print(f"Failed to enqueue SQS task {payload['hash']}: {e}")
-        return False
-
-
-def enqueue_audio_tasks(tasks):
-    """
-    Push multiple tasks to SQS. Returns set of successfully enqueued hashes.
+    Push many sentence tasks to SQS using send_message_batch (10 per request).
+    Returns a set of successfully enqueued hashes.
     """
     if not sqs_enabled():
         return set()
 
-    normalized = []
-    for task in tasks or []:
-        if not isinstance(task, dict):
+    # Keep first text for each hash to avoid duplicate enqueue calls.
+    deduped = {}
+    for sentence_hash, text in items:
+        payload = _build_sqs_payload(sentence_hash, text)
+        if not payload:
             continue
-        payload = _normalize_task_payload(
-            sentence_hash=task.get('hash'),
-            text=task.get('text'),
-            book_hash=task.get('book_hash'),
-            sentence_id=task.get('sentence_id'),
-            sentence_index=task.get('sentence_index'),
-            audio_format=task.get('format') or task.get('audio_format') or 'm4b'
-        )
-        if not payload['hash'] or not payload['text']:
+        if payload['hash'] in deduped:
             continue
-        normalized.append(payload)
+        deduped[payload['hash']] = payload['text']
 
-    if not normalized:
+    if not deduped:
         return set()
 
-    queued_hashes = set()
-    for start in range(0, len(normalized), 10):
-        chunk = normalized[start:start + 10]
+    pairs = list(deduped.items())
+    success_hashes = set()
+
+    for start in range(0, len(pairs), 10):
+        chunk = pairs[start:start + 10]
         entries = []
         id_to_hash = {}
-        for idx, payload in enumerate(chunk):
-            entry_id = f"m{start + idx}"
+        for idx, (sentence_hash, text) in enumerate(chunk):
+            payload = _build_sqs_payload(sentence_hash, text)
+            if not payload:
+                continue
+            entry_id = f"m{idx}"
             id_to_hash[entry_id] = payload['hash']
             entry = {
                 'Id': entry_id,
-                'MessageBody': json.dumps(payload, separators=(',', ':'))
+                'MessageBody': json.dumps(payload, separators=(',', ':')),
             }
             if sqs_is_fifo_queue():
-                group_hash = payload.get('book_hash') or 'audio-generation'
-                entry['MessageGroupId'] = group_hash
-                entry['MessageDeduplicationId'] = f"{group_hash}:{payload['hash']}"
+                entry['MessageGroupId'] = 'audio-generation'
+                entry['MessageDeduplicationId'] = payload['hash']
             entries.append(entry)
+
+        if not entries:
+            continue
 
         try:
             response = sqs_client.send_message_batch(
@@ -768,20 +889,29 @@ def enqueue_audio_tasks(tasks):
                 Entries=entries
             )
         except Exception as e:
-            print(f"Failed to enqueue SQS batch ({start}-{start + len(chunk)}): {e}")
+            print(f"Failed batch enqueue to SQS: {e}")
             continue
 
-        for success in response.get('Successful') or []:
-            queued_hash = id_to_hash.get(success.get('Id'))
-            if queued_hash:
-                queued_hashes.add(queued_hash)
+        for ok in (response.get('Successful') or []):
+            message_id = ok.get('Id')
+            sentence_hash = id_to_hash.get(message_id)
+            if sentence_hash:
+                success_hashes.add(sentence_hash)
 
-        for failed in response.get('Failed') or []:
-            failed_hash = id_to_hash.get(failed.get('Id'))
-            if failed_hash:
-                print(f"Failed to enqueue SQS task {failed_hash}: {failed.get('Message')}")
+        for failed in (response.get('Failed') or []):
+            message_id = failed.get('Id')
+            sentence_hash = id_to_hash.get(message_id)
+            if sentence_hash:
+                print(f"Failed to enqueue SQS task {sentence_hash}: {failed.get('Code')} {failed.get('Message')}")
 
-    return queued_hashes
+    return success_hashes
+
+
+def enqueue_audio_task(sentence_hash, text):
+    """
+    Push one sentence task to SQS. Returns True when enqueue request succeeds.
+    """
+    return bool(enqueue_audio_tasks_batch([(sentence_hash, text)]))
 
 
 def _extract_task_body(message):
@@ -885,17 +1015,16 @@ def backfill_pending_rows_to_sqs(db, limit=100):
         (stale_queued_before, max(1, min(limit, 500)))
     ).fetchall()
 
-    pushed = 0
-    queued_hashes = []
+    batch = []
     for row in rows:
         sentence_hash = (row['hash'] or '').strip()
         text = (row['text'] or '').strip()
         if not sentence_hash or not text:
             continue
-        if not enqueue_audio_task(sentence_hash, text):
-            continue
-        queued_hashes.append(sentence_hash)
-        pushed += 1
+        batch.append((sentence_hash, text))
+
+    queued_hashes = list(enqueue_audio_tasks_batch(batch))
+    pushed = len(queued_hashes)
     if queued_hashes:
         now = time.time()
         db.executemany(
@@ -908,6 +1037,49 @@ def backfill_pending_rows_to_sqs(db, limit=100):
             [(now, sentence_hash) for sentence_hash in queued_hashes]
         )
     return pushed
+
+
+def mark_book_audio_ready_for_hash(db, sentence_hash, s3_url, now=None):
+    """
+    When a hash becomes ready, mark matching pending/generating/failed book rows ready too.
+    Returns affected (user_id, book_id) pairs for progress refresh.
+    """
+    sentence_hash = (sentence_hash or '').strip()
+    s3_url = (s3_url or '').strip()
+    if not sentence_hash or not s3_url:
+        return set()
+
+    now = now or time.time()
+    s3_key, inferred = infer_audio_meta_from_url(s3_url)
+    audio_format, _ = normalize_audio_format(inferred)
+
+    rows = db.execute(
+        '''
+        SELECT DISTINCT user_id, book_id
+        FROM book_audio
+        WHERE hash = ? AND status != 'ready'
+        ''',
+        (sentence_hash,)
+    ).fetchall()
+    affected = {(r['user_id'], r['book_id']) for r in rows}
+    if not affected:
+        return set()
+
+    db.execute(
+        '''
+        UPDATE book_audio
+        SET status = 'ready',
+            s3_key = ?,
+            s3_url = ?,
+            audio_format = ?,
+            error = NULL,
+            completed_at = COALESCE(completed_at, ?),
+            updated_at = ?
+        WHERE hash = ? AND status != 'ready'
+        ''',
+        (s3_key, s3_url, audio_format, now, now, sentence_hash)
+    )
+    return affected
 
 
 def count_book_audio(db, user_id, book_id):
@@ -974,207 +1146,6 @@ def refresh_user_book_audio_progress(db, user_id, book_id):
         )
     )
     return summary
-
-
-def apply_ready_hash_to_book_rows(db, sentence_hash, s3_url, preferred_format='m4b'):
-    s3_key, inferred_format = infer_audio_meta_from_url(s3_url)
-    audio_format, _ = normalize_audio_format(preferred_format or inferred_format or 'm4b')
-    now = time.time()
-    db.execute(
-        '''
-        UPDATE book_audio
-        SET status = 'ready',
-            s3_key = ?,
-            s3_url = ?,
-            audio_format = ?,
-            completed_at = ?,
-            updated_at = ?,
-            error = NULL
-        WHERE hash = ?
-        ''',
-        (s3_key, s3_url, audio_format, now, now, sentence_hash)
-    )
-    rows = db.execute(
-        'SELECT DISTINCT user_id, book_id FROM book_audio WHERE hash = ?',
-        (sentence_hash,)
-    ).fetchall()
-    return {(row['user_id'], row['book_id']) for row in rows}
-
-
-def build_book_manifest_payload(db, user_id, book_id, book_hash):
-    rows = db.execute(
-        '''
-        SELECT sentence_id, sentence_index, hash, s3_key, s3_url, audio_format
-        FROM book_audio
-        WHERE user_id = ? AND book_id = ? AND status = 'ready' AND s3_url IS NOT NULL
-        ORDER BY sentence_index ASC
-        ''',
-        (user_id, book_id)
-    ).fetchall()
-    if not rows:
-        return None
-
-    items = []
-    for row in rows:
-        items.append({
-            'sentence_id': row['sentence_id'],
-            'sentence_index': int(row['sentence_index'] or 0),
-            'hash': row['hash'],
-            'key': row['s3_key'],
-            'url': row['s3_url'],
-            'format': row['audio_format'] or 'm4b',
-        })
-
-    return {
-        'book_hash': book_hash,
-        'book_id': book_id,
-        'generated_at': time.time(),
-        'count': len(items),
-        'items': items,
-    }
-
-
-def publish_book_manifest_if_complete(db, user_id, book_id):
-    row = db.execute(
-        'SELECT book_hash FROM user_books WHERE user_id = ? AND book_id = ?',
-        (user_id, book_id)
-    ).fetchone()
-    if not row:
-        return False
-
-    book_hash = normalize_book_hash(row['book_hash'], fallback_book_id=book_id)
-    if not book_hash:
-        return False
-
-    summary = count_book_audio(db, user_id, book_id)
-    if summary['total'] <= 0 or summary['ready'] < summary['total']:
-        return False
-
-    payload = build_book_manifest_payload(db, user_id, book_id, book_hash)
-    if not payload:
-        return False
-
-    key = get_book_manifest_key(book_hash)
-    if not key:
-        return False
-
-    try:
-        s3_client.put_object(
-            Bucket=AUDIO_BUCKET,
-            Key=key,
-            Body=json.dumps(payload, separators=(',', ':')).encode('utf-8'),
-            ContentType='application/json',
-            CacheControl='no-store'
-        )
-        return True
-    except Exception as e:
-        print(f"Failed publishing book manifest for {book_id}: {e}")
-        return False
-
-
-def hydrate_book_rows_from_manifest(db, user_id, book_id, sentences, manifest_payload):
-    if not isinstance(manifest_payload, dict):
-        return 0
-
-    items = manifest_payload.get('items')
-    if not isinstance(items, list) or not items:
-        return 0
-
-    by_hash = {}
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        sentence_hash = (item.get('hash') or '').strip()
-        url = (item.get('url') or '').strip()
-        if not sentence_hash or not url:
-            continue
-        by_hash[sentence_hash] = item
-
-    if not by_hash:
-        return 0
-
-    now = time.time()
-    applied = 0
-    for idx, entry in enumerate(sentences[:MAX_GENERATE_SENTENCES]):
-        if not isinstance(entry, dict):
-            continue
-        text = (entry.get('text') or '').strip()
-        if not text:
-            continue
-        sentence_id = (entry.get('id') or f"s_{idx}").strip()
-        if not sentence_id:
-            continue
-        sentence_index = max(0, parse_int(entry.get('sentence_index'), idx))
-        sentence_hash = (entry.get('hash') or hash_text(text)).strip()
-        if not sentence_hash:
-            continue
-        manifest_item = by_hash.get(sentence_hash)
-        if not manifest_item:
-            continue
-
-        s3_url = (manifest_item.get('url') or '').strip()
-        if not s3_url:
-            continue
-        s3_key = (manifest_item.get('key') or '').strip() or infer_audio_meta_from_url(s3_url)[0]
-        audio_format, _ = normalize_audio_format(manifest_item.get('format') or 'm4b')
-
-        db.execute(
-            '''
-            INSERT INTO audio_index (hash, text, status, s3_url, created_at, completed_at, updated_at)
-            VALUES (?, ?, 'ready', ?, ?, ?, ?)
-            ON CONFLICT(hash) DO UPDATE SET
-                text = COALESCE(NULLIF(excluded.text, ''), audio_index.text),
-                status = 'ready',
-                s3_url = excluded.s3_url,
-                completed_at = excluded.completed_at,
-                updated_at = excluded.updated_at,
-                claimed_by = NULL,
-                claimed_at = NULL,
-                queue_message_id = NULL,
-                queue_receipt_handle = NULL,
-                error = NULL
-            ''',
-            (sentence_hash, text, s3_url, now, now, now)
-        )
-
-        db.execute(
-            '''
-            INSERT INTO book_audio (
-                user_id, book_id, sentence_id, sentence_index, hash, text,
-                status, s3_key, s3_url, audio_format, error,
-                created_at, updated_at, completed_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?, NULL, ?, ?, ?)
-            ON CONFLICT(user_id, book_id, sentence_id) DO UPDATE SET
-                sentence_index = excluded.sentence_index,
-                hash = excluded.hash,
-                text = excluded.text,
-                status = 'ready',
-                s3_key = excluded.s3_key,
-                s3_url = excluded.s3_url,
-                audio_format = excluded.audio_format,
-                error = NULL,
-                updated_at = excluded.updated_at,
-                completed_at = excluded.completed_at
-            ''',
-            (
-                user_id,
-                book_id,
-                sentence_id,
-                sentence_index,
-                sentence_hash,
-                text,
-                s3_key,
-                s3_url,
-                audio_format,
-                now,
-                now,
-                now
-            )
-        )
-        applied += 1
-
-    return applied
 
 
 def claim_next_book_audio_job(user_id, book_id):
@@ -1461,15 +1432,12 @@ def serialize_book_row(row):
     audio_left_count = max(0, total_sentences - ready_audio_count)
     reading_percentage = max(0.0, min(100.0, row['reading_percentage'] or 0.0))
     audio_percentage = max(0.0, min(100.0, row['audio_percentage'] or 0.0))
-    cover_url = resolve_book_cover_url(row)
 
     return {
         'book_id': row['book_id'],
-        'book_hash': normalize_book_hash(row['book_hash'], fallback_book_id=row['book_id']) if 'book_hash' in row.keys() else row['book_id'],
         'title': row['title'],
         'author': row['author'] or '',
-        'cover_url': cover_url,
-        'cover_key': row['cover_key'],
+        'cover_url': row['cover_url'],
         'epub_url': row['epub_url'],
         'total_chapters': row['total_chapters'] or 0,
         'total_sentences': total_sentences,
@@ -1485,10 +1453,7 @@ def serialize_book_row(row):
             'total_sentences': total_sentences,
             'percentage': audio_percentage,
             'left_count': audio_left_count,
-            'left_percentage': max(0.0, 100.0 - audio_percentage),
-            'pending': audio_left_count,
-            'generating': 0,
-            'failed': 0
+            'left_percentage': max(0.0, 100.0 - audio_percentage)
         },
         'created_at': row['created_at'],
         'updated_at': row['updated_at'],
@@ -1507,7 +1472,7 @@ def health():
 
 
 @app.route('/check', methods=['POST'])
-@require_auth_or_worker
+@require_worker_or_auth
 def check_audio():
     """
     Check if audio exists for a sentence.
@@ -1578,7 +1543,7 @@ def check_audio():
 
 
 @app.route('/check_batch', methods=['POST'])
-@require_auth_or_worker
+@require_worker_or_auth
 def check_batch():
     """
     Check multiple sentences at once.
@@ -1655,7 +1620,7 @@ def check_batch():
 
 
 @app.route('/tasks', methods=['GET'])
-@require_auth
+@require_worker_or_auth
 def get_tasks():
     """
     Get pending tasks for volunteer nodes.
@@ -1667,45 +1632,165 @@ def get_tasks():
     db = get_db()
     user_id = g.user.get('sub', 'anonymous')
 
-    # Single-queue SQS mode is consumed directly by workers now.
-    # Keep this endpoint backward-compatible but non-consuming.
+    # Single-queue SQS mode (recommended).
     if sqs_enabled():
         reclaim_stale_generating_rows(db)
         backfill_pending_rows_to_sqs(db, limit=max(100, limit * 20))
         db.commit()
-        return jsonify({'tasks': [], 'deprecated': True})
+
+        tasks = []
+        receive_limit = min(limit, AUDIO_SQS_MAX_MESSAGES)
+
+        try:
+            response = sqs_client.receive_message(
+                QueueUrl=AUDIO_SQS_QUEUE_URL,
+                MaxNumberOfMessages=receive_limit,
+                WaitTimeSeconds=AUDIO_SQS_WAIT_SECONDS,
+                VisibilityTimeout=AUDIO_SQS_VISIBILITY_TIMEOUT,
+                MessageAttributeNames=['All'],
+                AttributeNames=['All']
+            )
+        except Exception as e:
+            print(f"SQS receive_message failed: {e}")
+            tasks = claim_pending_tasks_from_db(db, user_id, limit)
+            db.commit()
+            return jsonify({'tasks': tasks})
+
+        now = time.time()
+        messages = response.get('Messages') or []
+        for message in messages:
+            payload = _extract_task_body(message) or {}
+            sentence_hash = (payload.get('hash') or '').strip()
+            text = (payload.get('text') or '').strip()
+            message_id = message.get('MessageId')
+            receipt_handle = message.get('ReceiptHandle')
+            receive_count = parse_int((message.get('Attributes') or {}).get('ApproximateReceiveCount'), 1)
+
+            if not sentence_hash or not text or not receipt_handle:
+                delete_sqs_message(receipt_handle)
+                continue
+
+            row = db.execute(
+                'SELECT status, s3_url FROM audio_index WHERE hash = ?',
+                (sentence_hash,)
+            ).fetchone()
+
+            if row and row['status'] == 'ready' and row['s3_url']:
+                # Duplicate/stale queue message; ready already exists.
+                delete_sqs_message(receipt_handle)
+                continue
+
+            if receive_count > AUDIO_SQS_MAX_RECEIVE_COUNT:
+                # Poison message guard: cap retries and mark as failed.
+                send_to_dlq(payload, f'max_receive_exceeded:{receive_count}')
+                delete_sqs_message(receipt_handle)
+                db.execute(
+                    '''
+                    INSERT INTO audio_index (
+                        hash, text, status, created_at, updated_at, completed_at,
+                        claimed_by, claimed_at, queue_message_id, queue_receipt_handle,
+                        attempt_count, error
+                    )
+                    VALUES (?, ?, 'failed', ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
+                    ON CONFLICT(hash) DO UPDATE SET
+                        status = 'failed',
+                        claimed_by = excluded.claimed_by,
+                        claimed_at = excluded.claimed_at,
+                        queue_message_id = NULL,
+                        queue_receipt_handle = NULL,
+                        attempt_count = excluded.attempt_count,
+                        error = excluded.error,
+                        updated_at = excluded.updated_at
+                    ''',
+                    (
+                        sentence_hash,
+                        text,
+                        now,
+                        now,
+                        now,
+                        user_id,
+                        now,
+                        receive_count,
+                        f'max_receive_exceeded:{receive_count}',
+                    )
+                )
+                continue
+
+            db.execute(
+                '''
+                INSERT INTO audio_index (
+                    hash, text, status, created_at, updated_at,
+                    claimed_by, claimed_at, queue_message_id, queue_receipt_handle,
+                    attempt_count, error
+                )
+                VALUES (?, ?, 'generating', ?, ?, ?, ?, ?, ?, ?, NULL)
+                ON CONFLICT(hash) DO UPDATE SET
+                    text = COALESCE(NULLIF(excluded.text, ''), audio_index.text),
+                    status = CASE
+                        WHEN audio_index.status = 'ready' THEN 'ready'
+                        ELSE 'generating'
+                    END,
+                    claimed_by = excluded.claimed_by,
+                    claimed_at = excluded.claimed_at,
+                    queue_message_id = excluded.queue_message_id,
+                    queue_receipt_handle = excluded.queue_receipt_handle,
+                    attempt_count = MAX(COALESCE(audio_index.attempt_count, 0), excluded.attempt_count),
+                    error = NULL,
+                    updated_at = excluded.updated_at
+                ''',
+                (
+                    sentence_hash,
+                    text,
+                    now,
+                    now,
+                    user_id,
+                    now,
+                    message_id,
+                    receipt_handle,
+                    receive_count
+                )
+            )
+
+            fresh = db.execute(
+                'SELECT status FROM audio_index WHERE hash = ?',
+                (sentence_hash,)
+            ).fetchone()
+            if fresh and fresh['status'] == 'ready':
+                # Another worker completed between receive + upsert.
+                delete_sqs_message(receipt_handle)
+                db.execute(
+                    '''
+                    UPDATE audio_index
+                    SET queue_message_id = NULL,
+                        queue_receipt_handle = NULL,
+                        updated_at = ?
+                    WHERE hash = ?
+                    ''',
+                    (time.time(), sentence_hash)
+                )
+                continue
+
+            tasks.append({
+                'hash': sentence_hash,
+                'text': text
+            })
+
+        if not tasks:
+            # Fallback keeps workers productive when queue delivery is empty/misconfigured.
+            tasks = claim_pending_tasks_from_db(db, user_id, limit)
+
+        db.commit()
+        return jsonify({'tasks': tasks})
 
     # Legacy DB polling mode (no SQS configured).
-    rows = db.execute(
-        '''SELECT hash, text FROM audio_index
-           WHERE status = 'pending' AND (claimed_by IS NULL OR claimed_at < ?)
-           ORDER BY created_at ASC
-           LIMIT ?''',
-        (time.time() - 300, limit)  # Reclaim tasks older than 5 minutes
-    ).fetchall()
-
-    tasks = []
-    now = time.time()
-    for row in rows:
-        db.execute(
-            '''
-            UPDATE audio_index
-            SET claimed_by = ?, claimed_at = ?, status = 'generating', updated_at = ?
-            WHERE hash = ?
-            ''',
-            (user_id, now, now, row['hash'])
-        )
-        tasks.append({
-            'hash': row['hash'],
-            'text': row['text']
-        })
+    tasks = claim_pending_tasks_from_db(db, user_id, limit)
 
     db.commit()
     return jsonify({'tasks': tasks})
 
 
 @app.route('/complete', methods=['POST'])
-@require_auth_or_worker
+@require_worker_or_auth
 def complete_task():
     """
     Mark task as complete and store S3 URL.
@@ -1754,6 +1839,9 @@ def complete_task():
         ''',
         (sentence_hash, s3_url, now, now, now, user_id, now)
     )
+    affected_books = mark_book_audio_ready_for_hash(db, sentence_hash, s3_url, now=now)
+    for owner_id, owner_book_id in affected_books:
+        refresh_user_book_audio_progress(db, owner_id, owner_book_id)
 
     # Count completion only when this wasn't already ready.
     if not existing or existing['status'] != 'ready':
@@ -1768,26 +1856,14 @@ def complete_task():
             (user_id, now, now)
         )
 
-    updated_books = apply_ready_hash_to_book_rows(db, sentence_hash, s3_url, preferred_format='m4b')
-    summaries = {}
-    for owner_id, owner_book_id in updated_books:
-        summaries[owner_book_id] = refresh_user_book_audio_progress(db, owner_id, owner_book_id)
-        publish_book_manifest_if_complete(db, owner_id, owner_book_id)
-
     db.commit()
 
     sqs_deleted = delete_sqs_message(receipt_handle)
-    return jsonify({
-        'status': 'ok',
-        'idempotent': True,
-        'queue_deleted': bool(sqs_deleted),
-        'updated_books': len(updated_books),
-        'books': summaries
-    })
+    return jsonify({'status': 'ok', 'idempotent': True, 'queue_deleted': bool(sqs_deleted)})
 
 
 @app.route('/complete_batch', methods=['POST'])
-@require_auth_or_worker
+@require_worker_or_auth
 def complete_batch():
     """
     Mark multiple uploads complete.
@@ -1819,6 +1895,7 @@ def complete_batch():
     now = time.time()
     processed = 0
     updated_books = set()
+    hashes_to_propagate = {}
     queue_receipts = set()
 
     for item in items:
@@ -1865,6 +1942,7 @@ def complete_batch():
             ''',
             (sentence_hash, item_text, sentence_hash, s3_url, now, now)
         )
+        hashes_to_propagate[sentence_hash] = s3_url
 
         book_id = normalize_book_id(item.get('book_id')) or default_book_id
         sentence_id = (item.get('sentence_id') or '').strip()
@@ -1911,14 +1989,6 @@ def complete_batch():
             )
             updated_books.add((user_id, book_id))
 
-        for owner_id, owner_book_id in apply_ready_hash_to_book_rows(
-            db,
-            sentence_hash,
-            s3_url,
-            preferred_format=audio_format
-        ):
-            updated_books.add((owner_id, owner_book_id))
-
         processed += 1
 
     if processed > 0:
@@ -1933,10 +2003,12 @@ def complete_batch():
             (user_id, processed, now)
         )
 
+    for sentence_hash, s3_url in hashes_to_propagate.items():
+        updated_books.update(mark_book_audio_ready_for_hash(db, sentence_hash, s3_url, now=now))
+
     summaries = {}
     for owner_id, owner_book_id in updated_books:
         summaries[owner_book_id] = refresh_user_book_audio_progress(db, owner_id, owner_book_id)
-        publish_book_manifest_if_complete(db, owner_id, owner_book_id)
 
     db.commit()
     queue_deleted = 0
@@ -1953,7 +2025,7 @@ def complete_batch():
 
 
 @app.route('/upload_url', methods=['POST'])
-@require_auth_or_worker
+@require_worker_or_auth
 def get_upload_url():
     """
     Get presigned URL for uploading audio to S3.
@@ -1967,7 +2039,7 @@ def get_upload_url():
     if not sentence_hash:
         return jsonify({'error': 'Missing hash'}), 400
 
-    audio_ext, content_type = normalize_audio_format(data.get('format') or data.get('audio_format') or 'm4b')
+    audio_ext, content_type = normalize_audio_format(data.get('format') or data.get('audio_format') or 'wav')
 
     key = f"audio/{sentence_hash}.{audio_ext}"
 
@@ -1993,7 +2065,7 @@ def get_upload_url():
 
 
 @app.route('/upload_urls_batch', methods=['POST'])
-@require_auth_or_worker
+@require_worker_or_auth
 def get_upload_urls_batch():
     """
     Get presigned URLs for multiple sentence hashes.
@@ -2021,7 +2093,7 @@ def get_upload_urls_batch():
             continue
         seen.add(sentence_hash)
 
-        audio_ext, content_type = normalize_audio_format(item.get('format') or item.get('audio_format') or 'm4b')
+        audio_ext, content_type = normalize_audio_format(item.get('format') or item.get('audio_format') or 'wav')
         key = f"audio/{sentence_hash}.{audio_ext}"
 
         upload_url = s3_client.generate_presigned_url(
@@ -2125,7 +2197,6 @@ def upsert_user_book():
     if not book_id or not title:
         return jsonify({'error': 'Missing book_id or title'}), 400
 
-    book_hash = normalize_book_hash(data.get('book_hash'), fallback_book_id=book_id)
     epub_key = (data.get('epub_key') or f"users/{user_id}/books/{book_id}.epub").strip()
     epub_url = (data.get('epub_url') or build_s3_public_url(epub_key)).strip()
     cover_key = (data.get('cover_key') or '').strip() or None
@@ -2136,12 +2207,11 @@ def upsert_user_book():
     db.execute(
         '''
         INSERT INTO user_books (
-            user_id, book_id, book_hash, title, author, epub_key, epub_url, cover_key, cover_url,
+            user_id, book_id, title, author, epub_key, epub_url, cover_key, cover_url,
             total_chapters, total_sentences, chapter_index, sentence_index, sentence_id,
             reading_percentage, ready_audio_count, audio_percentage, created_at, updated_at, last_opened
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, NULL, 0, 0, 0, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, NULL, 0, 0, 0, ?, ?, ?)
         ON CONFLICT(user_id, book_id) DO UPDATE SET
-            book_hash = COALESCE(excluded.book_hash, user_books.book_hash, user_books.book_id),
             title = excluded.title,
             author = excluded.author,
             epub_key = excluded.epub_key,
@@ -2162,7 +2232,6 @@ def upsert_user_book():
         (
             user_id,
             book_id,
-            book_hash,
             title,
             (data.get('author') or '').strip(),
             epub_key,
@@ -2176,21 +2245,6 @@ def upsert_user_book():
             now
         )
     )
-
-    if check_book_manifest_exists(book_hash):
-        total_sentences = max(0, parse_int(data.get('total_sentences'), 0))
-        ready_audio_count = total_sentences
-        audio_percentage = 100.0 if total_sentences > 0 else 0.0
-        db.execute(
-            '''
-            UPDATE user_books
-            SET ready_audio_count = ?,
-                audio_percentage = ?,
-                updated_at = ?
-            WHERE user_id = ? AND book_id = ?
-            ''',
-            (ready_audio_count, audio_percentage, time.time(), user_id, book_id)
-        )
     db.commit()
 
     row = db.execute(
@@ -2444,39 +2498,17 @@ def generate_book_audio(book_id):
         return jsonify({'error': 'Invalid sentences payload'}), 400
 
     db = get_db()
-    book_row = db.execute(
-        'SELECT book_hash FROM user_books WHERE user_id = ? AND book_id = ?',
+    exists = db.execute(
+        'SELECT 1 FROM user_books WHERE user_id = ? AND book_id = ?',
         (user_id, book_id)
     ).fetchone()
-    if not book_row:
+    if not exists:
         return jsonify({'error': 'Book not found'}), 404
-
-    book_hash = normalize_book_hash(data.get('book_hash') or book_row['book_hash'], fallback_book_id=book_id)
-    if book_hash and (book_row['book_hash'] or '').strip() != book_hash:
-        db.execute(
-            'UPDATE user_books SET book_hash = ?, updated_at = ? WHERE user_id = ? AND book_id = ?',
-            (book_hash, time.time(), user_id, book_id)
-        )
-
-    manifest_payload = load_book_manifest(book_hash) if book_hash else None
-    if manifest_payload:
-        accepted = hydrate_book_rows_from_manifest(db, user_id, book_id, sentences, manifest_payload)
-        summary = refresh_user_book_audio_progress(db, user_id, book_id)
-        db.commit()
-        return jsonify({
-            'status': 'ready',
-            'accepted': accepted,
-            'scheduled': 0,
-            'sqs_enabled': sqs_enabled(),
-            'manifest_found': True,
-            'book_hash': book_hash,
-            'audio_progress': summary
-        })
 
     now = time.time()
     accepted = 0
     scheduled = 0
-    pending_enqueue = {}
+    pending_hash_to_text = {}
 
     for idx, item in enumerate(sentences[:MAX_GENERATE_SENTENCES]):
         if not isinstance(item, dict):
@@ -2493,7 +2525,7 @@ def generate_book_audio(book_id):
             continue
 
         existing = db.execute(
-            'SELECT status, s3_url, queue_message_id FROM audio_index WHERE hash = ?',
+            'SELECT status, s3_url FROM audio_index WHERE hash = ?',
             (sentence_hash,)
         ).fetchone()
         existing_ready = bool(existing and existing['status'] == 'ready' and existing['s3_url'])
@@ -2540,41 +2572,30 @@ def generate_book_audio(book_id):
             accepted += 1
             continue
 
-        should_enqueue = False
-        if existing:
-            db.execute(
-                '''
-                UPDATE audio_index
-                SET text = COALESCE(NULLIF(?, ''), text),
-                    status = CASE
-                        WHEN status = 'ready' THEN 'ready'
-                        WHEN status = 'generating' THEN 'generating'
-                        ELSE 'pending'
-                    END,
-                    updated_at = ?,
-                    error = NULL
-                WHERE hash = ?
-                ''',
-                (text, now, sentence_hash)
+        db.execute(
+            '''
+            INSERT INTO audio_index (
+                hash, text, status, created_at, completed_at,
+                claimed_by, claimed_at, updated_at,
+                queue_message_id, queue_receipt_handle, attempt_count, error
             )
-            should_enqueue = (
-                sqs_enabled()
-                and (existing['status'] not in ('ready', 'generating'))
-                and not (existing['queue_message_id'] or '').strip()
-            )
-        else:
-            db.execute(
-                '''
-                INSERT INTO audio_index (
-                    hash, text, status, created_at, completed_at,
-                    claimed_by, claimed_at, updated_at,
-                    queue_message_id, queue_receipt_handle, attempt_count, error
-                )
-                VALUES (?, ?, 'pending', ?, NULL, NULL, NULL, ?, NULL, NULL, 0, NULL)
-                ''',
-                (sentence_hash, text, now, now)
-            )
-            should_enqueue = sqs_enabled()
+            VALUES (?, ?, 'pending', ?, NULL, NULL, NULL, ?, NULL, NULL, 0, NULL)
+            ON CONFLICT(hash) DO UPDATE SET
+                text = COALESCE(NULLIF(excluded.text, ''), audio_index.text),
+                status = CASE
+                    WHEN audio_index.status = 'ready' THEN 'ready'
+                    ELSE 'pending'
+                END,
+                claimed_by = NULL,
+                claimed_at = NULL,
+                queue_message_id = NULL,
+                queue_receipt_handle = NULL,
+                updated_at = excluded.updated_at,
+                error = NULL
+            ''',
+            (sentence_hash, text, now, now)
+        )
+        pending_hash_to_text[sentence_hash] = text
 
         db.execute(
             '''
@@ -2583,7 +2604,7 @@ def generate_book_audio(book_id):
                 status, s3_key, s3_url, audio_format, error,
                 created_at, updated_at, completed_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, 'm4b', NULL, ?, ?, NULL)
+            VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, 'wav', NULL, ?, ?, NULL)
             ON CONFLICT(user_id, book_id, sentence_id) DO UPDATE SET
                 sentence_index = excluded.sentence_index,
                 hash = excluded.hash,
@@ -2607,25 +2628,16 @@ def generate_book_audio(book_id):
             )
         )
 
-        if should_enqueue and sentence_hash not in pending_enqueue:
-            pending_enqueue[sentence_hash] = {
-                'hash': sentence_hash,
-                'text': text,
-                'book_hash': book_hash,
-                'sentence_id': sentence_id,
-                'sentence_index': sentence_index,
-                'format': 'm4b'
-            }
-
         accepted += 1
 
         if accepted % GENERATE_AUDIO_DB_BATCH_SIZE == 0:
             db.commit()
 
-    if sqs_enabled() and pending_enqueue:
-        queued_hashes = enqueue_audio_tasks(list(pending_enqueue.values()))
-        scheduled = len(queued_hashes)
-        if queued_hashes:
+    if sqs_enabled() and pending_hash_to_text:
+        now = time.time()
+        scheduled_hashes = enqueue_audio_tasks_batch(list(pending_hash_to_text.items()))
+        scheduled = len(scheduled_hashes)
+        if scheduled_hashes:
             db.executemany(
                 '''
                 UPDATE audio_index
@@ -2633,7 +2645,7 @@ def generate_book_audio(book_id):
                     updated_at = ?
                 WHERE hash = ? AND status = 'pending'
                 ''',
-                [(time.time(), h) for h in queued_hashes]
+                [(now, sentence_hash) for sentence_hash in scheduled_hashes]
             )
 
     summary = refresh_user_book_audio_progress(db, user_id, book_id)
@@ -2644,8 +2656,6 @@ def generate_book_audio(book_id):
         'accepted': accepted,
         'scheduled': scheduled,
         'sqs_enabled': sqs_enabled(),
-        'manifest_found': False,
-        'book_hash': book_hash,
         'audio_progress': summary
     })
 
@@ -2659,14 +2669,12 @@ def get_book_audio_progress(book_id):
         return jsonify({'error': 'Invalid book_id'}), 400
 
     db = get_db()
-    book_row = db.execute(
-        'SELECT book_hash FROM user_books WHERE user_id = ? AND book_id = ?',
+    exists = db.execute(
+        'SELECT 1 FROM user_books WHERE user_id = ? AND book_id = ?',
         (user_id, book_id)
     ).fetchone()
-    if not book_row:
+    if not exists:
         return jsonify({'error': 'Book not found'}), 404
-
-    book_hash = normalize_book_hash(book_row['book_hash'], fallback_book_id=book_id)
 
     summary = refresh_user_book_audio_progress(db, user_id, book_id)
     db.commit()
@@ -2705,89 +2713,6 @@ def get_book_audio_manifest(book_id):
         (user_id, book_id, limit)
     ).fetchall()
 
-    if not rows and book_hash:
-        manifest_payload = load_book_manifest(book_hash)
-        if manifest_payload:
-            items = manifest_payload.get('items')
-            if isinstance(items, list):
-                count = 0
-                now = time.time()
-                for item in items:
-                    if count >= limit:
-                        break
-                    if not isinstance(item, dict):
-                        continue
-                    sentence_hash = (item.get('hash') or '').strip()
-                    sentence_id = (item.get('sentence_id') or '').strip()
-                    s3_url = (item.get('url') or '').strip()
-                    if not sentence_hash or not sentence_id or not s3_url:
-                        continue
-                    sentence_index = max(0, parse_int(item.get('sentence_index'), 0))
-                    s3_key = (item.get('key') or '').strip() or infer_audio_meta_from_url(s3_url)[0]
-                    audio_format, _ = normalize_audio_format(item.get('format') or 'm4b')
-                    db.execute(
-                        '''
-                        INSERT INTO book_audio (
-                            user_id, book_id, sentence_id, sentence_index, hash, text,
-                            status, s3_key, s3_url, audio_format, error,
-                            created_at, updated_at, completed_at
-                        )
-                        VALUES (?, ?, ?, ?, ?, '', 'ready', ?, ?, ?, NULL, ?, ?, ?)
-                        ON CONFLICT(user_id, book_id, sentence_id) DO UPDATE SET
-                            sentence_index = excluded.sentence_index,
-                            hash = excluded.hash,
-                            status = 'ready',
-                            s3_key = excluded.s3_key,
-                            s3_url = excluded.s3_url,
-                            audio_format = excluded.audio_format,
-                            error = NULL,
-                            updated_at = excluded.updated_at,
-                            completed_at = excluded.completed_at
-                        ''',
-                        (
-                            user_id,
-                            book_id,
-                            sentence_id,
-                            sentence_index,
-                            sentence_hash,
-                            s3_key,
-                            s3_url,
-                            audio_format,
-                            now,
-                            now,
-                            now
-                        )
-                    )
-                    db.execute(
-                        '''
-                        INSERT INTO audio_index (hash, text, status, s3_url, created_at, completed_at, updated_at)
-                        VALUES (?, '', 'ready', ?, ?, ?, ?)
-                        ON CONFLICT(hash) DO UPDATE SET
-                            status = 'ready',
-                            s3_url = excluded.s3_url,
-                            completed_at = excluded.completed_at,
-                            updated_at = excluded.updated_at,
-                            claimed_by = NULL,
-                            claimed_at = NULL,
-                            queue_message_id = NULL,
-                            queue_receipt_handle = NULL,
-                            error = NULL
-                        ''',
-                        (sentence_hash, s3_url, now, now, now)
-                    )
-                    count += 1
-
-                rows = db.execute(
-                    '''
-                    SELECT sentence_id, sentence_index, hash, s3_url, audio_format
-                    FROM book_audio
-                    WHERE user_id = ? AND book_id = ? AND status = 'ready' AND s3_url IS NOT NULL
-                    ORDER BY sentence_index ASC
-                    LIMIT ?
-                    ''',
-                    (user_id, book_id, limit)
-                ).fetchall()
-
     summary = refresh_user_book_audio_progress(db, user_id, book_id)
     db.commit()
 
@@ -2796,7 +2721,7 @@ def get_book_audio_manifest(book_id):
         'sentence_index': row['sentence_index'] or 0,
         'hash': row['hash'],
         'url': row['s3_url'],
-        'format': row['audio_format'] or 'm4b'
+        'format': row['audio_format'] or 'wav'
     } for row in rows]
 
     return jsonify({
@@ -2804,115 +2729,6 @@ def get_book_audio_manifest(book_id):
         'count': len(items),
         'items': items,
         'audio_progress': summary
-    })
-
-
-@app.route('/books/<book_id>/chat_history', methods=['GET'])
-@require_auth
-def get_book_chat_history(book_id):
-    user_id = get_current_user_id()
-    book_id = normalize_book_id(book_id)
-    if not book_id:
-        return jsonify({'error': 'Invalid book_id'}), 400
-
-    db = get_db()
-    if not get_user_book_title(db, user_id, book_id):
-        return jsonify({'error': 'Book not found'}), 404
-
-    limit = parse_int(request.args.get('limit'), BOOK_CHAT_HISTORY_LIMIT)
-    messages = get_book_chat_messages(db, user_id, book_id, limit=limit)
-    return jsonify({
-        'book_id': book_id,
-        'messages': messages
-    })
-
-
-@app.route('/books/<book_id>/chat_history', methods=['DELETE'])
-@require_auth
-def clear_book_chat_history(book_id):
-    user_id = get_current_user_id()
-    book_id = normalize_book_id(book_id)
-    if not book_id:
-        return jsonify({'error': 'Invalid book_id'}), 400
-
-    db = get_db()
-    if not get_user_book_title(db, user_id, book_id):
-        return jsonify({'error': 'Book not found'}), 404
-
-    before = db.execute(
-        'SELECT COUNT(*) AS c FROM book_chat_messages WHERE user_id = ? AND book_id = ?',
-        (user_id, book_id)
-    ).fetchone()
-    db.execute(
-        'DELETE FROM book_chat_messages WHERE user_id = ? AND book_id = ?',
-        (user_id, book_id)
-    )
-    db.commit()
-
-    return jsonify({
-        'ok': True,
-        'book_id': book_id,
-        'cleared': int((before['c'] if before else 0) or 0)
-    })
-
-
-@app.route('/books/<book_id>/chat', methods=['POST'])
-@require_auth
-def book_chat(book_id):
-    user_id = get_current_user_id()
-    book_id = normalize_book_id(book_id)
-    if not book_id:
-        return jsonify({'error': 'Invalid book_id'}), 400
-
-    if not OPENAI_API_KEY:
-        return jsonify({'error': 'OPENAI_API_KEY is not configured on coordinator.'}), 503
-
-    data = request.json or {}
-    user_message = truncate_text(data.get('message') or '', BOOK_CHAT_MAX_MESSAGE_CHARS)
-    if not user_message:
-        return jsonify({'error': 'Missing message'}), 400
-
-    context_payload = data.get('context') if isinstance(data.get('context'), dict) else {}
-
-    db = get_db()
-    book_title = get_user_book_title(db, user_id, book_id)
-    if not book_title:
-        return jsonify({'error': 'Book not found'}), 404
-
-    history_rows = get_book_chat_messages(db, user_id, book_id, limit=BOOK_CHAT_CONTEXT_LIMIT)
-    model_messages = [{
-        'role': 'system',
-        'content': (
-            'You are an EPUB reading companion. Keep answers concise, practical, and grounded in the passage. '
-            'Use the conversation history for continuity. If asked about content not in context, say so clearly. '
-            f'Current book: "{book_title}".'
-        )
-    }]
-    model_messages.extend({
-        'role': row['role'],
-        'content': row['content']
-    } for row in history_rows)
-    model_messages.append({
-        'role': 'user',
-        'content': build_chat_user_message(user_message, context_payload)
-    })
-
-    try:
-        assistant_reply = call_openai_chat(model_messages)
-    except Exception as e:
-        return jsonify({'error': f'Chat request failed: {str(e)}'}), 502
-
-    store_book_chat_message(db, user_id, book_id, 'user', user_message)
-    store_book_chat_message(db, user_id, book_id, 'assistant', assistant_reply)
-    trim_book_chat_messages(db, user_id, book_id, keep_count=BOOK_CHAT_HISTORY_LIMIT)
-    db.commit()
-
-    latest_messages = get_book_chat_messages(db, user_id, book_id, limit=BOOK_CHAT_HISTORY_LIMIT)
-    return jsonify({
-        'book_id': book_id,
-        'reply': assistant_reply,
-        'model': OPENAI_MODEL,
-        'messages': latest_messages
     })
 
 
@@ -2976,6 +2792,775 @@ def proxy_audio_by_hash(sentence_hash):
         headers=headers,
         direct_passthrough=True
     )
+
+
+# =============================================================================
+# Book Clubs
+# =============================================================================
+
+@app.route('/clubs', methods=['GET'])
+@require_auth
+def list_clubs():
+    db = get_db()
+    user_id = get_current_user_id()
+    rows = db.execute(
+        '''
+        SELECT c.*
+        FROM clubs c
+        JOIN club_members m ON m.club_id = c.id
+        WHERE m.user_id = ?
+        ORDER BY c.updated_at DESC, c.created_at DESC
+        ''',
+        (user_id,)
+    ).fetchall()
+    return jsonify({'clubs': [serialize_club_row(db, row, include_members=True) for row in rows]})
+
+
+@app.route('/clubs', methods=['POST'])
+@require_auth
+def create_club():
+    data = request.json or {}
+    name = (data.get('name') or '').strip()
+    if not name:
+        return jsonify({'error': 'Missing club name'}), 400
+
+    description = (data.get('description') or '').strip() or None
+    join_policy = (data.get('joinPolicy') or data.get('join_policy') or 'link').strip().lower()
+    if join_policy not in ('link', 'approval'):
+        join_policy = 'link'
+
+    profile = current_user_profile()
+    now = time.time()
+    club_id = f"club-{uuid.uuid4().hex[:12]}"
+
+    db = get_db()
+    invite_code = None
+    for _ in range(8):
+        candidate = generate_invite_code(8)
+        existing = db.execute('SELECT 1 FROM clubs WHERE invite_code = ?', (candidate,)).fetchone()
+        if not existing:
+            invite_code = candidate
+            break
+    if not invite_code:
+        return jsonify({'error': 'Failed generating invite code'}), 500
+
+    db.execute(
+        '''
+        INSERT INTO clubs (
+            id, name, description, created_at, updated_at,
+            owner_user_id, invite_code, join_policy, active_book_id,
+            plan_json, pinned_post_id
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)
+        ''',
+        (club_id, name, description, now, now, profile['user_id'], invite_code, join_policy)
+    )
+    db.execute(
+        '''
+        INSERT INTO club_members (
+            club_id, user_id, display_name, avatar_color, role, joined_at,
+            hide_progress, progress_by_book_json, notifications_json
+        )
+        VALUES (?, ?, ?, ?, 'owner', ?, 0, '{}', ?)
+        ''',
+        (club_id, profile['user_id'], profile['display_name'], profile['avatar_color'], now, json.dumps(_default_member_notifications()))
+    )
+    db.commit()
+
+    row = db.execute('SELECT * FROM clubs WHERE id = ?', (club_id,)).fetchone()
+    return jsonify({'club': serialize_club_row(db, row, include_members=True)})
+
+
+@app.route('/clubs/join', methods=['POST'])
+@require_auth
+def join_club():
+    data = request.json or {}
+    invite_code = (data.get('inviteCode') or data.get('invite_code') or '').strip().upper()
+    if not invite_code:
+        return jsonify({'error': 'Missing invite code'}), 400
+
+    db = get_db()
+    profile = current_user_profile()
+    row = db.execute(
+        'SELECT * FROM clubs WHERE invite_code = ?',
+        (invite_code,)
+    ).fetchone()
+    if not row:
+        return jsonify({'error': 'Invalid invite code'}), 404
+
+    membership = db.execute(
+        'SELECT role FROM club_members WHERE club_id = ? AND user_id = ?',
+        (row['id'], profile['user_id'])
+    ).fetchone()
+    if membership:
+        return jsonify({'status': 'joined', 'club': serialize_club_row(db, row, include_members=True)})
+
+    if row['join_policy'] == 'approval':
+        db.execute(
+            '''
+            INSERT INTO club_join_requests (club_id, user_id, requested_at, status)
+            VALUES (?, ?, ?, 'pending')
+            ON CONFLICT(club_id, user_id) DO UPDATE SET
+                requested_at = excluded.requested_at,
+                status = 'pending'
+            ''',
+            (row['id'], profile['user_id'], time.time())
+        )
+        db.commit()
+        return jsonify({'status': 'pending', 'clubId': row['id']}), 202
+
+    now = time.time()
+    db.execute(
+        '''
+        INSERT INTO club_members (
+            club_id, user_id, display_name, avatar_color, role, joined_at,
+            hide_progress, progress_by_book_json, notifications_json
+        )
+        VALUES (?, ?, ?, ?, 'member', ?, 0, '{}', ?)
+        ''',
+        (row['id'], profile['user_id'], profile['display_name'], profile['avatar_color'], now, json.dumps(_default_member_notifications()))
+    )
+    db.execute('UPDATE clubs SET updated_at = ? WHERE id = ?', (now, row['id']))
+    db.commit()
+    refreshed = db.execute('SELECT * FROM clubs WHERE id = ?', (row['id'],)).fetchone()
+    return jsonify({'status': 'joined', 'club': serialize_club_row(db, refreshed, include_members=True)})
+
+
+@app.route('/clubs/<club_id>', methods=['GET'])
+@require_auth
+def get_club(club_id):
+    db = get_db()
+    user_id = get_current_user_id()
+    row, error_response = ensure_member_access(db, club_id, user_id)
+    if error_response:
+        return error_response
+    return jsonify({'club': serialize_club_row(db, row, include_members=True)})
+
+
+@app.route('/clubs/<club_id>', methods=['PATCH'])
+@require_auth
+def update_club(club_id):
+    db = get_db()
+    user_id = get_current_user_id()
+    row, error_response = ensure_owner_access(db, club_id, user_id)
+    if error_response:
+        return error_response
+
+    data = request.json or {}
+    name = (data.get('name') if 'name' in data else row['name']) or row['name']
+    name = str(name).strip()
+    if not name:
+        return jsonify({'error': 'Club name cannot be empty'}), 400
+
+    description = data.get('description') if 'description' in data else row['description']
+    if description is not None:
+        description = str(description).strip() or None
+
+    join_policy = data.get('joinPolicy') if 'joinPolicy' in data else data.get('join_policy')
+    if join_policy is None:
+        join_policy = row['join_policy']
+    join_policy = str(join_policy).strip().lower()
+    if join_policy not in ('link', 'approval'):
+        return jsonify({'error': 'Invalid joinPolicy'}), 400
+
+    active_book_id = data.get('activeBookId') if 'activeBookId' in data else data.get('active_book_id')
+    if active_book_id is None:
+        active_book_id = row['active_book_id']
+    active_book_id = str(active_book_id).strip() or None
+
+    plan = data.get('plan') if 'plan' in data else safe_json_load(row['plan_json'], None)
+    if plan is not None and not isinstance(plan, dict):
+        return jsonify({'error': 'Invalid plan payload'}), 400
+
+    pinned_post_id = data.get('pinnedPostId') if 'pinnedPostId' in data else data.get('pinned_post_id')
+    if pinned_post_id is None:
+        pinned_post_id = row['pinned_post_id']
+    pinned_post_id = str(pinned_post_id).strip() or None
+
+    now = time.time()
+    db.execute(
+        '''
+        UPDATE clubs
+        SET name = ?,
+            description = ?,
+            join_policy = ?,
+            active_book_id = ?,
+            plan_json = ?,
+            pinned_post_id = ?,
+            updated_at = ?
+        WHERE id = ?
+        ''',
+        (name, description, join_policy, active_book_id, json.dumps(plan) if plan is not None else None, pinned_post_id, now, club_id)
+    )
+    db.commit()
+
+    refreshed = db.execute('SELECT * FROM clubs WHERE id = ?', (club_id,)).fetchone()
+    return jsonify({'club': serialize_club_row(db, refreshed, include_members=True)})
+
+
+@app.route('/clubs/<club_id>', methods=['DELETE'])
+@require_auth
+def delete_club(club_id):
+    db = get_db()
+    user_id = get_current_user_id()
+    row, error_response = ensure_owner_access(db, club_id, user_id)
+    if error_response:
+        return error_response
+
+    db.execute('DELETE FROM club_thread_messages WHERE thread_id IN (SELECT id FROM club_threads WHERE club_id = ?)', (club_id,))
+    db.execute('DELETE FROM club_threads WHERE club_id = ?', (club_id,))
+    db.execute('DELETE FROM club_posts WHERE club_id = ?', (club_id,))
+    db.execute('DELETE FROM club_members WHERE club_id = ?', (club_id,))
+    db.execute('DELETE FROM club_join_requests WHERE club_id = ?', (club_id,))
+    db.execute('DELETE FROM club_spoiler_preferences WHERE club_id = ?', (club_id,))
+    db.execute('DELETE FROM clubs WHERE id = ?', (club_id,))
+    db.commit()
+    return jsonify({'status': 'deleted', 'clubId': club_id})
+
+
+@app.route('/clubs/<club_id>/leave', methods=['POST'])
+@require_auth
+def leave_club(club_id):
+    db = get_db()
+    user_id = get_current_user_id()
+    row, error_response = ensure_member_access(db, club_id, user_id)
+    if error_response:
+        return error_response
+
+    if row['owner_user_id'] == user_id:
+        db.execute('DELETE FROM club_thread_messages WHERE thread_id IN (SELECT id FROM club_threads WHERE club_id = ?)', (club_id,))
+        db.execute('DELETE FROM club_threads WHERE club_id = ?', (club_id,))
+        db.execute('DELETE FROM club_posts WHERE club_id = ?', (club_id,))
+        db.execute('DELETE FROM club_members WHERE club_id = ?', (club_id,))
+        db.execute('DELETE FROM club_join_requests WHERE club_id = ?', (club_id,))
+        db.execute('DELETE FROM club_spoiler_preferences WHERE club_id = ?', (club_id,))
+        db.execute('DELETE FROM clubs WHERE id = ?', (club_id,))
+        db.commit()
+        return jsonify({'status': 'deleted', 'clubId': club_id})
+
+    db.execute('DELETE FROM club_members WHERE club_id = ? AND user_id = ?', (club_id, user_id))
+    db.execute('DELETE FROM club_spoiler_preferences WHERE club_id = ? AND user_id = ?', (club_id, user_id))
+    db.execute('UPDATE clubs SET updated_at = ? WHERE id = ?', (time.time(), club_id))
+    db.commit()
+    return jsonify({'status': 'left', 'clubId': club_id})
+
+
+@app.route('/clubs/<club_id>/invite_code/regenerate', methods=['POST'])
+@require_auth
+def regenerate_club_invite_code(club_id):
+    db = get_db()
+    user_id = get_current_user_id()
+    _, error_response = ensure_owner_access(db, club_id, user_id)
+    if error_response:
+        return error_response
+
+    invite_code = None
+    for _ in range(8):
+        candidate = generate_invite_code(8)
+        existing = db.execute('SELECT 1 FROM clubs WHERE invite_code = ? AND id != ?', (candidate, club_id)).fetchone()
+        if not existing:
+            invite_code = candidate
+            break
+    if not invite_code:
+        return jsonify({'error': 'Failed generating invite code'}), 500
+
+    now = time.time()
+    db.execute('UPDATE clubs SET invite_code = ?, updated_at = ? WHERE id = ?', (invite_code, now, club_id))
+    db.commit()
+    row = db.execute('SELECT * FROM clubs WHERE id = ?', (club_id,)).fetchone()
+    return jsonify({'club': serialize_club_row(db, row, include_members=True)})
+
+
+@app.route('/clubs/<club_id>/members', methods=['GET'])
+@require_auth
+def list_club_members(club_id):
+    db = get_db()
+    user_id = get_current_user_id()
+    _, error_response = ensure_member_access(db, club_id, user_id)
+    if error_response:
+        return error_response
+
+    rows = db.execute(
+        '''
+        SELECT *
+        FROM club_members
+        WHERE club_id = ?
+        ORDER BY CASE role WHEN 'owner' THEN 0 ELSE 1 END, joined_at ASC
+        ''',
+        (club_id,)
+    ).fetchall()
+    return jsonify({'members': [serialize_club_member(row) for row in rows]})
+
+
+@app.route('/clubs/<club_id>/members/<member_user_id>', methods=['DELETE'])
+@require_auth
+def remove_club_member(club_id, member_user_id):
+    db = get_db()
+    user_id = get_current_user_id()
+    row, error_response = ensure_owner_access(db, club_id, user_id)
+    if error_response:
+        return error_response
+    if member_user_id == row['owner_user_id']:
+        return jsonify({'error': 'Cannot remove owner'}), 400
+
+    db.execute('DELETE FROM club_members WHERE club_id = ? AND user_id = ?', (club_id, member_user_id))
+    db.execute('DELETE FROM club_spoiler_preferences WHERE club_id = ? AND user_id = ?', (club_id, member_user_id))
+    db.execute('UPDATE clubs SET updated_at = ? WHERE id = ?', (time.time(), club_id))
+    db.commit()
+    return jsonify({'status': 'ok', 'clubId': club_id, 'userId': member_user_id})
+
+
+@app.route('/clubs/<club_id>/members/me/progress', methods=['POST'])
+@require_auth
+def update_member_progress(club_id):
+    db = get_db()
+    user_id = get_current_user_id()
+    _, error_response = ensure_member_access(db, club_id, user_id)
+    if error_response:
+        return error_response
+
+    data = request.json or {}
+    book_id = str(data.get('bookId') or data.get('book_id') or '').strip()
+    chapter_id = str(data.get('chapterId') or data.get('chapter_id') or '').strip()
+    sentence_index = max(0, parse_int(data.get('sentenceIndex') or data.get('sentence_index'), 0))
+    if not book_id or not chapter_id:
+        return jsonify({'error': 'Missing bookId/chapterId'}), 400
+
+    current = db.execute(
+        'SELECT progress_by_book_json FROM club_members WHERE club_id = ? AND user_id = ?',
+        (club_id, user_id)
+    ).fetchone()
+    progress_map = _normalize_progress_map(safe_json_load(current['progress_by_book_json'] if current else '{}', {}))
+    progress_map[book_id] = {
+        'chapterId': chapter_id,
+        'sentenceIndex': sentence_index,
+    }
+
+    db.execute(
+        '''
+        UPDATE club_members
+        SET progress_by_book_json = ?
+        WHERE club_id = ? AND user_id = ?
+        ''',
+        (json.dumps(progress_map), club_id, user_id)
+    )
+    db.execute('UPDATE clubs SET updated_at = ? WHERE id = ?', (time.time(), club_id))
+    db.commit()
+    return jsonify({'status': 'ok', 'progressByBook': progress_map})
+
+
+@app.route('/clubs/<club_id>/posts', methods=['GET'])
+@require_auth
+def list_club_posts(club_id):
+    db = get_db()
+    user_id = get_current_user_id()
+    _, error_response = ensure_member_access(db, club_id, user_id)
+    if error_response:
+        return error_response
+
+    rows = db.execute(
+        '''
+        SELECT *
+        FROM club_posts
+        WHERE club_id = ?
+        ORDER BY created_at DESC
+        ''',
+        (club_id,)
+    ).fetchall()
+    return jsonify({'posts': [serialize_club_post_row(row) for row in rows]})
+
+
+@app.route('/clubs/<club_id>/posts', methods=['POST'])
+@require_auth
+def create_club_post(club_id):
+    db = get_db()
+    profile = current_user_profile()
+    _, error_response = ensure_member_access(db, club_id, profile['user_id'])
+    if error_response:
+        return error_response
+
+    data = request.json or {}
+    text = str(data.get('text') or '').strip()
+    if not text:
+        return jsonify({'error': 'Missing text'}), 400
+
+    post_id = str(data.get('id') or f"post-{uuid.uuid4().hex[:12]}").strip()
+    spoiler_boundary = _default_spoiler_boundary(data.get('spoilerBoundary') or data.get('spoiler_boundary'))
+    reply_to_post_id = str(data.get('replyToPostId') or data.get('reply_to_post_id') or '').strip() or None
+    attached_thread_id = str(data.get('attachedPassageThreadId') or data.get('attached_passage_thread_id') or '').strip() or None
+    mentions = data.get('mentions')
+    mentions_json = json.dumps([str(x) for x in mentions if x]) if isinstance(mentions, list) else None
+    now = time.time()
+
+    db.execute(
+        '''
+        INSERT INTO club_posts (
+            id, club_id, author_user_id, created_at, text,
+            spoiler_boundary_json, reactions_json, reply_to_post_id,
+            mentions_json, attached_passage_thread_id
+        )
+        VALUES (?, ?, ?, ?, ?, ?, '{}', ?, ?, ?)
+        ''',
+        (
+            post_id,
+            club_id,
+            profile['user_id'],
+            now,
+            text,
+            json.dumps(spoiler_boundary) if spoiler_boundary else None,
+            reply_to_post_id,
+            mentions_json,
+            attached_thread_id
+        )
+    )
+    db.execute('UPDATE clubs SET updated_at = ? WHERE id = ?', (now, club_id))
+    db.commit()
+    row = db.execute('SELECT * FROM club_posts WHERE id = ?', (post_id,)).fetchone()
+    return jsonify({'post': serialize_club_post_row(row)})
+
+
+@app.route('/clubs/<club_id>/posts/<post_id>', methods=['DELETE'])
+@require_auth
+def delete_club_post(club_id, post_id):
+    db = get_db()
+    user_id = get_current_user_id()
+    club_row, error_response = ensure_member_access(db, club_id, user_id)
+    if error_response:
+        return error_response
+
+    row = db.execute(
+        'SELECT author_user_id FROM club_posts WHERE id = ? AND club_id = ?',
+        (post_id, club_id)
+    ).fetchone()
+    if not row:
+        return jsonify({'error': 'Post not found'}), 404
+
+    if row['author_user_id'] != user_id and club_row['owner_user_id'] != user_id:
+        return jsonify({'error': 'Forbidden'}), 403
+
+    db.execute('DELETE FROM club_posts WHERE id = ? AND club_id = ?', (post_id, club_id))
+    db.execute('UPDATE clubs SET updated_at = ? WHERE id = ?', (time.time(), club_id))
+    db.commit()
+    return jsonify({'status': 'ok', 'postId': post_id})
+
+
+@app.route('/clubs/<club_id>/posts/<post_id>/reactions', methods=['PUT'])
+@require_auth
+def toggle_post_reaction(club_id, post_id):
+    db = get_db()
+    user_id = get_current_user_id()
+    _, error_response = ensure_member_access(db, club_id, user_id)
+    if error_response:
+        return error_response
+
+    data = request.json or {}
+    emoji = str(data.get('emoji') or '').strip()
+    if not emoji:
+        return jsonify({'error': 'Missing emoji'}), 400
+
+    row = db.execute(
+        'SELECT * FROM club_posts WHERE id = ? AND club_id = ?',
+        (post_id, club_id)
+    ).fetchone()
+    if not row:
+        return jsonify({'error': 'Post not found'}), 404
+
+    reactions = safe_json_load(row['reactions_json'], {})
+    if not isinstance(reactions, dict):
+        reactions = {}
+    users = [str(uid) for uid in reactions.get(emoji, []) if uid]
+    if user_id in users:
+        users = [uid for uid in users if uid != user_id]
+    else:
+        users.append(user_id)
+    if users:
+        reactions[emoji] = users
+    elif emoji in reactions:
+        del reactions[emoji]
+
+    db.execute(
+        'UPDATE club_posts SET reactions_json = ? WHERE id = ?',
+        (json.dumps(reactions), post_id)
+    )
+    db.execute('UPDATE clubs SET updated_at = ? WHERE id = ?', (time.time(), club_id))
+    db.commit()
+    refreshed = db.execute('SELECT * FROM club_posts WHERE id = ?', (post_id,)).fetchone()
+    return jsonify({'post': serialize_club_post_row(refreshed)})
+
+
+@app.route('/clubs/<club_id>/threads', methods=['GET'])
+@require_auth
+def list_club_threads(club_id):
+    db = get_db()
+    user_id = get_current_user_id()
+    _, error_response = ensure_member_access(db, club_id, user_id)
+    if error_response:
+        return error_response
+
+    book_id = str(request.args.get('bookId') or request.args.get('book_id') or '').strip()
+    if book_id:
+        rows = db.execute(
+            '''
+            SELECT *
+            FROM club_threads
+            WHERE club_id = ? AND book_id = ?
+            ORDER BY created_at DESC
+            ''',
+            (club_id, book_id)
+        ).fetchall()
+    else:
+        rows = db.execute(
+            '''
+            SELECT *
+            FROM club_threads
+            WHERE club_id = ?
+            ORDER BY created_at DESC
+            ''',
+            (club_id,)
+        ).fetchall()
+
+    threads = [serialize_club_thread_row(db, row, include_messages=True) for row in rows]
+    return jsonify({'threads': threads})
+
+
+@app.route('/clubs/<club_id>/threads', methods=['POST'])
+@require_auth
+def create_club_thread(club_id):
+    db = get_db()
+    profile = current_user_profile()
+    _, error_response = ensure_member_access(db, club_id, profile['user_id'])
+    if error_response:
+        return error_response
+
+    data = request.json or {}
+    book_id = str(data.get('bookId') or data.get('book_id') or '').strip()
+    chapter_id = str(data.get('chapterId') or data.get('chapter_id') or '').strip()
+    sentence_range = data.get('sentenceRange') if isinstance(data.get('sentenceRange'), dict) else {}
+    if not book_id or not chapter_id:
+        return jsonify({'error': 'Missing bookId/chapterId'}), 400
+
+    sentence_start = max(0, parse_int(sentence_range.get('start'), parse_int(data.get('sentence_start'), 0)))
+    sentence_end = max(sentence_start, parse_int(sentence_range.get('end'), parse_int(data.get('sentence_end'), sentence_start)))
+    title = str(data.get('title') or '').strip() or None
+    spoiler_boundary = _default_spoiler_boundary(data.get('spoilerBoundary') or data.get('spoiler_boundary')) or {
+        'chapterId': chapter_id,
+        'sentenceIndex': sentence_start,
+    }
+    initial_message = str(data.get('initialMessage') or data.get('initial_message') or '').strip()
+
+    now = time.time()
+    thread_id = str(data.get('id') or f"thread-{uuid.uuid4().hex[:12]}").strip()
+    db.execute(
+        '''
+        INSERT INTO club_threads (
+            id, club_id, book_id, chapter_id, sentence_start, sentence_end,
+            created_at, created_by_user_id, title, spoiler_boundary_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''',
+        (
+            thread_id,
+            club_id,
+            book_id,
+            chapter_id,
+            sentence_start,
+            sentence_end,
+            now,
+            profile['user_id'],
+            title,
+            json.dumps(spoiler_boundary)
+        )
+    )
+
+    if initial_message:
+        message_id = f"msg-{uuid.uuid4().hex[:12]}"
+        db.execute(
+            '''
+            INSERT INTO club_thread_messages (
+                id, thread_id, author_user_id, created_at, text, reactions_json
+            )
+            VALUES (?, ?, ?, ?, ?, '{}')
+            ''',
+            (message_id, thread_id, profile['user_id'], now, initial_message)
+        )
+
+    db.execute('UPDATE clubs SET updated_at = ? WHERE id = ?', (now, club_id))
+    db.commit()
+    row = db.execute('SELECT * FROM club_threads WHERE id = ? AND club_id = ?', (thread_id, club_id)).fetchone()
+    return jsonify({'thread': serialize_club_thread_row(db, row, include_messages=True)})
+
+
+@app.route('/clubs/<club_id>/threads/<thread_id>/messages', methods=['POST'])
+@require_auth
+def add_thread_message(club_id, thread_id):
+    db = get_db()
+    profile = current_user_profile()
+    _, error_response = ensure_member_access(db, club_id, profile['user_id'])
+    if error_response:
+        return error_response
+
+    thread = db.execute(
+        'SELECT id FROM club_threads WHERE id = ? AND club_id = ?',
+        (thread_id, club_id)
+    ).fetchone()
+    if not thread:
+        return jsonify({'error': 'Thread not found'}), 404
+
+    data = request.json or {}
+    text = str(data.get('text') or '').strip()
+    if not text:
+        return jsonify({'error': 'Missing text'}), 400
+
+    now = time.time()
+    message_id = str(data.get('id') or f"msg-{uuid.uuid4().hex[:12]}").strip()
+    db.execute(
+        '''
+        INSERT INTO club_thread_messages (
+            id, thread_id, author_user_id, created_at, text, reactions_json
+        )
+        VALUES (?, ?, ?, ?, ?, '{}')
+        ''',
+        (message_id, thread_id, profile['user_id'], now, text)
+    )
+    db.execute('UPDATE clubs SET updated_at = ? WHERE id = ?', (now, club_id))
+    db.commit()
+
+    row = db.execute(
+        'SELECT * FROM club_thread_messages WHERE id = ? AND thread_id = ?',
+        (message_id, thread_id)
+    ).fetchone()
+    return jsonify({'message': serialize_club_message_row(row)})
+
+
+@app.route('/clubs/<club_id>/threads/<thread_id>/messages/<message_id>', methods=['DELETE'])
+@require_auth
+def delete_thread_message(club_id, thread_id, message_id):
+    db = get_db()
+    user_id = get_current_user_id()
+    club_row, error_response = ensure_member_access(db, club_id, user_id)
+    if error_response:
+        return error_response
+
+    message = db.execute(
+        '''
+        SELECT m.author_user_id
+        FROM club_thread_messages m
+        JOIN club_threads t ON t.id = m.thread_id
+        WHERE m.id = ? AND m.thread_id = ? AND t.club_id = ?
+        ''',
+        (message_id, thread_id, club_id)
+    ).fetchone()
+    if not message:
+        return jsonify({'error': 'Message not found'}), 404
+
+    if message['author_user_id'] != user_id and club_row['owner_user_id'] != user_id:
+        return jsonify({'error': 'Forbidden'}), 403
+
+    db.execute('DELETE FROM club_thread_messages WHERE id = ? AND thread_id = ?', (message_id, thread_id))
+    db.execute('UPDATE clubs SET updated_at = ? WHERE id = ?', (time.time(), club_id))
+    db.commit()
+    return jsonify({'status': 'ok', 'messageId': message_id})
+
+
+@app.route('/clubs/<club_id>/threads/<thread_id>/messages/<message_id>/reactions', methods=['PUT'])
+@require_auth
+def toggle_thread_message_reaction(club_id, thread_id, message_id):
+    db = get_db()
+    user_id = get_current_user_id()
+    _, error_response = ensure_member_access(db, club_id, user_id)
+    if error_response:
+        return error_response
+
+    data = request.json or {}
+    emoji = str(data.get('emoji') or '').strip()
+    if not emoji:
+        return jsonify({'error': 'Missing emoji'}), 400
+
+    row = db.execute(
+        '''
+        SELECT m.*
+        FROM club_thread_messages m
+        JOIN club_threads t ON t.id = m.thread_id
+        WHERE m.id = ? AND m.thread_id = ? AND t.club_id = ?
+        ''',
+        (message_id, thread_id, club_id)
+    ).fetchone()
+    if not row:
+        return jsonify({'error': 'Message not found'}), 404
+
+    reactions = safe_json_load(row['reactions_json'], {})
+    if not isinstance(reactions, dict):
+        reactions = {}
+    users = [str(uid) for uid in reactions.get(emoji, []) if uid]
+    if user_id in users:
+        users = [uid for uid in users if uid != user_id]
+    else:
+        users.append(user_id)
+    if users:
+        reactions[emoji] = users
+    elif emoji in reactions:
+        del reactions[emoji]
+
+    db.execute(
+        'UPDATE club_thread_messages SET reactions_json = ? WHERE id = ? AND thread_id = ?',
+        (json.dumps(reactions), message_id, thread_id)
+    )
+    db.execute('UPDATE clubs SET updated_at = ? WHERE id = ?', (time.time(), club_id))
+    db.commit()
+    refreshed = db.execute(
+        'SELECT * FROM club_thread_messages WHERE id = ? AND thread_id = ?',
+        (message_id, thread_id)
+    ).fetchone()
+    return jsonify({'message': serialize_club_message_row(refreshed)})
+
+
+@app.route('/clubs/<club_id>/spoiler_preference', methods=['GET'])
+@require_auth
+def get_club_spoiler_preference(club_id):
+    db = get_db()
+    user_id = get_current_user_id()
+    _, error_response = ensure_member_access(db, club_id, user_id)
+    if error_response:
+        return error_response
+
+    row = db.execute(
+        '''
+        SELECT preference
+        FROM club_spoiler_preferences
+        WHERE club_id = ? AND user_id = ?
+        ''',
+        (club_id, user_id)
+    ).fetchone()
+    return jsonify({'clubId': club_id, 'preference': row['preference'] if row else None})
+
+
+@app.route('/clubs/<club_id>/spoiler_preference', methods=['PUT'])
+@require_auth
+def set_club_spoiler_preference(club_id):
+    db = get_db()
+    user_id = get_current_user_id()
+    _, error_response = ensure_member_access(db, club_id, user_id)
+    if error_response:
+        return error_response
+
+    data = request.json or {}
+    preference = str(data.get('preference') or '').strip()
+    if preference not in ('reveal_all',):
+        return jsonify({'error': 'Invalid preference'}), 400
+
+    now = time.time()
+    db.execute(
+        '''
+        INSERT INTO club_spoiler_preferences (club_id, user_id, preference, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(club_id, user_id) DO UPDATE SET
+            preference = excluded.preference,
+            updated_at = excluded.updated_at
+        ''',
+        (club_id, user_id, preference, now)
+    )
+    db.commit()
+    return jsonify({'clubId': club_id, 'preference': preference})
 
 
 @app.route('/stats')

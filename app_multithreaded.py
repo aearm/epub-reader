@@ -5,6 +5,7 @@ from flask_socketio import SocketIO, emit
 import os
 import json
 import hashlib
+import base64
 from pathlib import Path
 from werkzeug.utils import secure_filename
 from utils.epub_processor_v2 import EPUBProcessorV2 as EPUBProcessor
@@ -23,6 +24,7 @@ import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import boto3
+from botocore.config import Config
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'your-secret-key'
@@ -64,11 +66,72 @@ ALLOWED_EXTENSIONS = {'epub'}
 COORDINATOR_API_URL = (
     os.environ.get('COORDINATOR_API_URL') or 'https://api.reader.psybytes.com'
 ).strip().rstrip('/')
-AWS_REGION = (os.environ.get('AWS_REGION') or 'us-east-2').strip()
-WORKER_AUDIO_SQS_QUEUE_URL = (os.environ.get('AUDIO_SQS_QUEUE_URL') or '').strip()
-WORKER_AUDIO_SQS_WAIT_SECONDS = max(0, min(int(os.environ.get('AUDIO_SQS_WAIT_SECONDS', '10')), 20))
-WORKER_AUDIO_SQS_MAX_MESSAGES = max(1, min(int(os.environ.get('AUDIO_SQS_MAX_MESSAGES', '10')), 10))
-WORKER_AUDIO_SQS_VISIBILITY_TIMEOUT = max(30, int(os.environ.get('AUDIO_SQS_VISIBILITY_TIMEOUT', '180')))
+
+
+def _extract_worker_shared_secret(value):
+    if not isinstance(value, str):
+        return ''
+    text = value.strip()
+    if not text:
+        return ''
+    if text.startswith('{') and text.endswith('}'):
+        try:
+            payload = json.loads(text)
+            if isinstance(payload, dict):
+                for key in ('worker_shared_secret', 'WORKER_SHARED_SECRET', 'secret'):
+                    candidate = payload.get(key)
+                    if isinstance(candidate, str) and candidate.strip():
+                        return candidate.strip()
+        except Exception:
+            return text
+    return text
+
+
+def load_worker_shared_secret():
+    env_secret = _extract_worker_shared_secret(os.environ.get('WORKER_SHARED_SECRET') or '')
+    if env_secret:
+        return env_secret, 'env'
+
+    aws_region = (os.environ.get('AWS_REGION') or os.environ.get('AWS_DEFAULT_REGION') or '').strip() or None
+    secret_ids = [
+        (os.environ.get('WORKER_SHARED_SECRET_SECRET_ID') or '').strip(),
+    ]
+    parameter_names = [
+        (os.environ.get('WORKER_SHARED_SECRET_PARAMETER_NAME') or '').strip(),
+        '/epub-reader/worker-shared-secret',
+    ]
+
+    # Try Secrets Manager first, then SSM Parameter Store.
+    try:
+        session = boto3.session.Session(region_name=aws_region)
+    except Exception:
+        return '', None
+    boto_config = Config(connect_timeout=2, read_timeout=2, retries={'max_attempts': 1})
+
+    for secret_id in [s for s in secret_ids if s]:
+        try:
+            sm = session.client('secretsmanager', config=boto_config)
+            response = sm.get_secret_value(SecretId=secret_id)
+            secret = _extract_worker_shared_secret(response.get('SecretString', ''))
+            if secret:
+                return secret, f'secretsmanager:{secret_id}'
+        except Exception:
+            continue
+
+    for name in [n for n in parameter_names if n]:
+        try:
+            ssm = session.client('ssm', config=boto_config)
+            response = ssm.get_parameter(Name=name, WithDecryption=True)
+            secret = _extract_worker_shared_secret(response.get('Parameter', {}).get('Value', ''))
+            if secret:
+                return secret, f'ssm:{name}'
+        except Exception:
+            continue
+
+    return '', None
+
+
+WORKER_SHARED_SECRET, WORKER_SHARED_SECRET_SOURCE = load_worker_shared_secret()
 COORDINATOR_BEARER_TOKEN = os.environ.get('COORDINATOR_BEARER_TOKEN', '').strip()
 COORDINATOR_TIMEOUT = float(os.environ.get('COORDINATOR_TIMEOUT', '20'))
 COORDINATOR_BATCH_SIZE = 100
@@ -101,14 +164,19 @@ WORKER_UPLOAD_URL_BATCH_SIZE = max(1, int(os.environ.get('WORKER_UPLOAD_URL_BATC
 WORKER_COMPLETE_BATCH_SIZE = max(1, int(os.environ.get('WORKER_COMPLETE_BATCH_SIZE', '50')))
 WORKER_MP3_BITRATE = os.environ.get('WORKER_MP3_BITRATE', '64k').strip() or '64k'
 WORKER_MP3_SAMPLE_RATE = str(int(os.environ.get('WORKER_MP3_SAMPLE_RATE', '24000')))
-WORKER_IDLE_BACKFILL_ENABLED = os.environ.get('WORKER_IDLE_BACKFILL_ENABLED', '1').strip().lower() not in ('0', 'false', 'no')
-WORKER_SQS_CONCURRENCY = max(
+COORDINATOR_IDLE_POLL_INTERVAL = max(0.5, float(os.environ.get('COORDINATOR_IDLE_POLL_INTERVAL', '2.0')))
+COORDINATOR_IDLE_TASK_BATCH_SIZE = max(
     1,
-    min(16, int(os.environ.get('WORKER_SQS_CONCURRENCY', str(min(4, WORKER_TTS_POOL_SIZE)))))
+    min(10, int(os.environ.get('COORDINATOR_IDLE_TASK_BATCH_SIZE', '10')))
 )
+WORKER_IDLE_BACKFILL_ENABLED = os.environ.get('WORKER_IDLE_BACKFILL_ENABLED', '1').strip().lower() not in ('0', 'false', 'no')
 COORDINATOR_TOKEN_STATE_PATH = (
     os.environ.get('COORDINATOR_TOKEN_STATE_PATH') or 'static/state/coordinator_token.json'
 ).strip()
+COORDINATOR_TOKEN_SYNC_POLL_SECONDS = max(
+    0.5,
+    float(os.environ.get('COORDINATOR_TOKEN_SYNC_POLL_SECONDS', '2.0'))
+)
 
 # Ensure directories exist
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
@@ -139,29 +207,31 @@ current_page_sentences = []  # list of sentence_ids for currently visible page
 sentence_hashes = {}          # sentence_id -> coordinator hash
 sentence_remote_urls = {}     # sentence_id -> S3 URL
 coordinator_enabled = bool(COORDINATOR_API_URL)
-worker_sqs_enabled = bool(WORKER_AUDIO_SQS_QUEUE_URL)
-worker_sqs_client = boto3.client('sqs', region_name=AWS_REGION) if worker_sqs_enabled else None
 coordinator_sync_lock = threading.Lock()
 coordinator_metrics = {
     'requests_ok': 0,
     'requests_failed': 0,
     'uploads_ok': 0,
     'uploads_failed': 0,
-    'idle_tasks_claimed': 0,   # SQS messages claimed
-    'idle_tasks_completed': 0, # SQS messages completed+acked
-    'idle_tasks_failed': 0,    # SQS messages failed (left for retry)
+    'idle_tasks_claimed': 0,
+    'idle_tasks_completed': 0,
+    'idle_tasks_failed': 0,
     'last_error': None
 }
 runtime_coordinator_token = None
 runtime_token_lock = threading.Lock()
+runtime_token_last_sync_at = 0.0
+runtime_token_last_mtime = None
 book_jobs = {}
 book_jobs_lock = threading.Lock()
 idle_backfill_lock = threading.Lock()
-idle_backfill_threads = []
+idle_task_poll_lock = threading.Lock()
+idle_task_backoff_until = 0.0
+idle_backfill_thread = None
 
-if coordinator_enabled and not COORDINATOR_BEARER_TOKEN:
+if coordinator_enabled and not COORDINATOR_BEARER_TOKEN and not WORKER_SHARED_SECRET:
     print("WARNING: Coordinator is enabled without startup token. "
-          "Expect bearer token from logged-in web app or set COORDINATOR_BEARER_TOKEN.")
+          "Expect bearer token from logged-in web app or set COORDINATOR_BEARER_TOKEN/WORKER_SHARED_SECRET.")
 
 
 # -----------------------------------------------------------------------------
@@ -192,41 +262,101 @@ def _extract_bearer_token(value: str):
     return token or None
 
 
+def _decode_jwt_payload_unverified(token: str):
+    if not isinstance(token, str):
+        return None
+    parts = token.split('.')
+    if len(parts) != 3:
+        return None
+    segment = parts[1]
+    padding = '=' * (-len(segment) % 4)
+    try:
+        raw = base64.urlsafe_b64decode(segment + padding)
+        payload = json.loads(raw.decode('utf-8'))
+        return payload if isinstance(payload, dict) else None
+    except Exception:
+        return None
+
+
+def _is_jwt_expired(token: str, leeway_seconds: int = 30) -> bool:
+    payload = _decode_jwt_payload_unverified(token)
+    if not payload:
+        return False
+    exp = payload.get('exp')
+    if exp is None:
+        return False
+    try:
+        return time.time() >= float(exp) - leeway_seconds
+    except (TypeError, ValueError):
+        return False
+
+
 def set_runtime_coordinator_token(token: str):
     """Store runtime Cognito token for background coordinator calls."""
-    global runtime_coordinator_token
+    global runtime_coordinator_token, runtime_token_last_sync_at
     if not token:
         return
     with runtime_token_lock:
         runtime_coordinator_token = token
+    runtime_token_last_sync_at = time.time()
     persist_runtime_coordinator_token(token)
+
+
+def clear_runtime_coordinator_token():
+    """Clear runtime token and remove persisted copy."""
+    global runtime_coordinator_token, runtime_token_last_mtime, runtime_token_last_sync_at
+    with runtime_token_lock:
+        runtime_coordinator_token = None
+    runtime_token_last_mtime = None
+    runtime_token_last_sync_at = time.time()
+    try:
+        path = Path(COORDINATOR_TOKEN_STATE_PATH)
+        if path.exists():
+            path.unlink()
+    except Exception as e:
+        print(f"WARNING: Failed to clear persisted coordinator token: {e}")
 
 
 def persist_runtime_coordinator_token(token: str):
     """Persist runtime token so worker reconnects after container restart."""
+    global runtime_token_last_mtime, runtime_token_last_sync_at
     if not token or token == COORDINATOR_BEARER_TOKEN:
         return
     try:
         path = Path(COORDINATOR_TOKEN_STATE_PATH)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(token.strip(), encoding='utf-8')
+        runtime_token_last_mtime = path.stat().st_mtime
+        runtime_token_last_sync_at = time.time()
     except Exception as e:
         print(f"WARNING: Failed to persist coordinator token: {e}")
 
 
-def load_runtime_coordinator_token():
+def load_runtime_coordinator_token(force=False):
     """Load persisted runtime token if available."""
-    global runtime_coordinator_token
-    if runtime_coordinator_token:
+    global runtime_coordinator_token, runtime_token_last_sync_at, runtime_token_last_mtime
+    now = time.time()
+    if not force and (now - runtime_token_last_sync_at) < COORDINATOR_TOKEN_SYNC_POLL_SECONDS:
         return
+    runtime_token_last_sync_at = now
     try:
         path = Path(COORDINATOR_TOKEN_STATE_PATH)
         if not path.exists():
+            runtime_token_last_mtime = None
+            with runtime_token_lock:
+                runtime_coordinator_token = None
+            return
+        stat = path.stat()
+        if not force and runtime_token_last_mtime is not None and stat.st_mtime <= runtime_token_last_mtime:
             return
         token = path.read_text(encoding='utf-8').strip()
+        runtime_token_last_mtime = stat.st_mtime
         if token and token.count('.') == 2:
             with runtime_token_lock:
                 runtime_coordinator_token = token
+        else:
+            with runtime_token_lock:
+                runtime_coordinator_token = None
     except Exception as e:
         print(f"WARNING: Failed to load persisted coordinator token: {e}")
 
@@ -247,10 +377,48 @@ def capture_coordinator_token_from_request(data=None):
 
 def get_effective_coordinator_token():
     """Return runtime token first, then static env token."""
+    load_runtime_coordinator_token()
+    runtime_token = None
     with runtime_token_lock:
         if runtime_coordinator_token:
-            return runtime_coordinator_token
-    return COORDINATOR_BEARER_TOKEN or None
+            runtime_token = runtime_coordinator_token
+
+    if runtime_token and _is_jwt_expired(runtime_token):
+        clear_runtime_coordinator_token()
+        runtime_token = None
+
+    if runtime_token:
+        return runtime_token
+
+    env_token = COORDINATOR_BEARER_TOKEN or None
+    if env_token and _is_jwt_expired(env_token):
+        return None
+    return env_token
+
+
+def apply_worker_token_request(data=None):
+    """
+    Set/clear runtime coordinator token from worker API calls.
+    Accepts:
+    - Authorization: Bearer <token>
+    - JSON body { "access_token": "<token>" }
+    - JSON body { "clear": true } to clear runtime token
+    """
+    payload = data if isinstance(data, dict) else (request.get_json(silent=True) or {})
+    if payload.get('clear') is True:
+        clear_runtime_coordinator_token()
+        return {'success': True, 'cleared': True}
+
+    captured = capture_coordinator_token_from_request(payload)
+    if not captured:
+        return {'success': False, 'error': 'Missing bearer token'}
+
+    return {
+        'success': True,
+        'cleared': False,
+        'has_bearer_token': bool(get_effective_coordinator_token()),
+        'token_source': 'runtime' if bool(runtime_coordinator_token) else ('env' if bool(COORDINATOR_BEARER_TOKEN) else None),
+    }
 
 
 def coordinator_headers(include_json=True):
@@ -261,6 +429,8 @@ def coordinator_headers(include_json=True):
     token = get_effective_coordinator_token()
     if token:
         headers['Authorization'] = f'Bearer {token}'
+    if WORKER_SHARED_SECRET:
+        headers['X-Worker-Secret'] = WORKER_SHARED_SECRET
     return headers
 
 
@@ -272,20 +442,34 @@ def coordinator_request(method: str, path: str, json_data=None, timeout=None):
     url = urljoin(f"{COORDINATOR_API_URL}/", path.lstrip('/'))
 
     try:
-        response = requests.request(
-            method=method,
-            url=url,
-            json=json_data,
-            headers=coordinator_headers(include_json=True),
-            timeout=timeout or COORDINATOR_TIMEOUT
-        )
-        if response.status_code >= 400:
-            print(f"Coordinator error {response.status_code} for {path}: {response.text[:300]}")
-            coordinator_metrics['requests_failed'] += 1
-            coordinator_metrics['last_error'] = f"{path}: HTTP {response.status_code}"
-            return None
-        coordinator_metrics['requests_ok'] += 1
-        return response.json()
+        response = None
+        for attempt in range(2):
+            before = get_effective_coordinator_token()
+            response = requests.request(
+                method=method,
+                url=url,
+                json=json_data,
+                headers=coordinator_headers(include_json=True),
+                timeout=timeout or COORDINATOR_TIMEOUT
+            )
+            if response.status_code < 400:
+                coordinator_metrics['requests_ok'] += 1
+                return response.json()
+            if response.status_code == 401 and attempt == 0:
+                load_runtime_coordinator_token(force=True)
+                after = get_effective_coordinator_token()
+                if after and after != before:
+                    continue
+                with runtime_token_lock:
+                    had_runtime = bool(runtime_coordinator_token)
+                if had_runtime:
+                    clear_runtime_coordinator_token()
+            break
+
+        print(f"Coordinator error {response.status_code} for {path}: {response.text[:300]}")
+        coordinator_metrics['requests_failed'] += 1
+        coordinator_metrics['last_error'] = f"{path}: HTTP {response.status_code}"
+        return None
     except Exception as e:
         print(f"Coordinator request failed ({path}): {e}")
         coordinator_metrics['requests_failed'] += 1
@@ -315,22 +499,17 @@ def cache_remote_audio(remote_url: str, target_path: str) -> bool:
         return False
 
 
-def upload_audio_to_coordinator(sentence_hash: str, audio_path: str, upload_format: str = None, book_hash: str = None):
+def upload_audio_to_coordinator(sentence_hash: str, audio_path: str):
     """Upload generated audio to S3 via coordinator and mark task complete."""
     if not coordinator_enabled:
         return None
 
-    effective_format = normalize_upload_format(upload_format or AUDIO_UPLOAD_FORMAT)
-    asset = audio_backend.build_upload_asset(audio_path, effective_format)
+    asset = audio_backend.build_upload_asset(audio_path, AUDIO_UPLOAD_FORMAT)
 
     upload = coordinator_request(
         'POST',
         '/upload_url',
-        json_data={
-            'hash': sentence_hash,
-            'format': asset.audio_format,
-            'book_hash': (book_hash or '').strip() or None
-        }
+        json_data={'hash': sentence_hash, 'format': asset.audio_format}
     )
     if not upload:
         coordinator_metrics['uploads_failed'] += 1
@@ -420,120 +599,102 @@ def generate_sentence_locally(sentence_hash: str, text: str, output_dir: str):
     )
 
 
-def extract_sqs_task_body(message):
-    raw = (message or {}).get('Body')
-    if not raw:
-        return None
-    try:
-        payload = json.loads(raw)
-    except Exception:
-        return None
-
-    if isinstance(payload, dict) and isinstance(payload.get('Message'), str):
-        try:
-            nested = json.loads(payload['Message'])
-            if isinstance(nested, dict):
-                payload = nested
-        except Exception:
-            pass
-
-    return payload if isinstance(payload, dict) else None
-
-
-def delete_worker_sqs_message(receipt_handle: str):
-    if not worker_sqs_client or not WORKER_AUDIO_SQS_QUEUE_URL or not receipt_handle:
+def process_idle_coordinator_task(task):
+    """Generate and upload one coordinator task payload."""
+    task = task or {}
+    sentence_hash = (task.get('hash') or '').strip()
+    text = (task.get('text') or '').strip()
+    if not sentence_hash or not text:
+        coordinator_metrics['idle_tasks_failed'] += 1
+        coordinator_metrics['last_error'] = 'idle task missing hash/text'
         return False
-    try:
-        worker_sqs_client.delete_message(
-            QueueUrl=WORKER_AUDIO_SQS_QUEUE_URL,
-            ReceiptHandle=receipt_handle
-        )
+
+    coordinator_metrics['idle_tasks_claimed'] += 1
+
+    # Double-check before generation in case another node already completed.
+    existing = coordinator_request(
+        'POST',
+        '/check',
+        json_data={'hash': sentence_hash, 'text': text}
+    )
+    if existing and existing.get('status') == 'ready' and existing.get('url'):
+        coordinator_metrics['idle_tasks_completed'] += 1
         return True
-    except Exception as e:
-        coordinator_metrics['last_error'] = f'sqs delete failed: {str(e)}'
+
+    output_dir = os.path.join(app.config['AUDIO_FOLDER'], 'worker_cache')
+    os.makedirs(output_dir, exist_ok=True)
+
+    audio_path = generate_sentence_locally(sentence_hash, text, output_dir)
+    if not audio_path:
+        # One retry for transient generation failures.
+        time.sleep(0.15)
+        audio_path = generate_sentence_locally(sentence_hash, text, output_dir)
+    if not audio_path:
+        coordinator_metrics['idle_tasks_failed'] += 1
+        coordinator_metrics['last_error'] = f'idle generation failed for {sentence_hash}'
         return False
+
+    uploaded_url = upload_audio_to_coordinator(sentence_hash, audio_path)
+    if uploaded_url:
+        coordinator_metrics['idle_tasks_completed'] += 1
+        return True
+
+    # Last check: another worker may have completed between our upload/complete attempts.
+    existing = coordinator_request(
+        'POST',
+        '/check',
+        json_data={'hash': sentence_hash, 'text': text}
+    )
+    if existing and existing.get('status') == 'ready' and existing.get('url'):
+        coordinator_metrics['idle_tasks_completed'] += 1
+        return True
+
+    coordinator_metrics['idle_tasks_failed'] += 1
+    coordinator_metrics['last_error'] = f'idle upload/complete failed for {sentence_hash}'
+    return False
 
 
 def process_idle_coordinator_task_once():
     """
-    Consume one SQS message and process it end-to-end:
-    generate local audio -> upload to S3 via coordinator -> delete SQS message.
+    Generate one coordinator-pending sentence when the local priority queue is empty.
+    This keeps current/nearby-page work highest priority and uses only spare capacity
+    for other books.
     """
-    if not WORKER_IDLE_BACKFILL_ENABLED:
-        return False
-    if not worker_sqs_enabled or not worker_sqs_client:
-        return False
+    global idle_task_backoff_until
+
     if not coordinator_enabled or not get_effective_coordinator_token():
         return False
 
-    # Only one SQS consumer thread executes the claim/generate/upload cycle at a time.
+    # Only one worker performs idle backfill at a time.
     if not idle_backfill_lock.acquire(blocking=False):
         return False
 
     try:
-        response = worker_sqs_client.receive_message(
-            QueueUrl=WORKER_AUDIO_SQS_QUEUE_URL,
-            MaxNumberOfMessages=1,
-            WaitTimeSeconds=WORKER_AUDIO_SQS_WAIT_SECONDS,
-            VisibilityTimeout=WORKER_AUDIO_SQS_VISIBILITY_TIMEOUT,
-            AttributeNames=['All']
-        )
-        messages = response.get('Messages') or []
-        if not messages:
+        now = time.time()
+        with idle_task_poll_lock:
+            if now < idle_task_backoff_until:
+                return False
+
+        result = coordinator_request('GET', f'/tasks?limit={COORDINATOR_IDLE_TASK_BATCH_SIZE}')
+        tasks = (result or {}).get('tasks') or []
+        if not tasks:
+            with idle_task_poll_lock:
+                idle_task_backoff_until = time.time() + COORDINATOR_IDLE_POLL_INTERVAL
             return False
 
-        message = messages[0]
-        receipt_handle = (message.get('ReceiptHandle') or '').strip()
-        payload = extract_sqs_task_body(message) or {}
-        sentence_hash = (payload.get('hash') or '').strip()
-        text = (payload.get('text') or '').strip()
-        upload_format = normalize_upload_format(payload.get('format') or AUDIO_UPLOAD_FORMAT)
-        book_hash = (payload.get('book_hash') or '').strip()
+        with idle_task_poll_lock:
+            idle_task_backoff_until = 0.0
 
-        if not sentence_hash or not text or not receipt_handle:
-            delete_worker_sqs_message(receipt_handle)
-            coordinator_metrics['idle_tasks_failed'] += 1
-            coordinator_metrics['last_error'] = 'invalid_sqs_payload'
-            return False
+        did_work = False
+        for task in tasks:
+            if process_idle_coordinator_task(task):
+                did_work = True
 
-        coordinator_metrics['idle_tasks_claimed'] += 1
-
-        output_dir = os.path.join(app.config['AUDIO_FOLDER'], 'worker_cache')
-        os.makedirs(output_dir, exist_ok=True)
-
-        audio_path = generate_sentence_locally(sentence_hash, text, output_dir)
-        if not audio_path:
-            time.sleep(0.15)
-            audio_path = generate_sentence_locally(sentence_hash, text, output_dir)
-        if not audio_path:
-            coordinator_metrics['idle_tasks_failed'] += 1
-            coordinator_metrics['last_error'] = f'generation_failed:{sentence_hash}'
-            return False
-
-        uploaded_url = upload_audio_to_coordinator(
-            sentence_hash,
-            audio_path,
-            upload_format=upload_format,
-            book_hash=book_hash
-        )
-        if not uploaded_url:
-            # Keep message for retry; clean local temp so disk usage does not grow.
-            audio_backend.cleanup_paths([audio_path])
-            coordinator_metrics['idle_tasks_failed'] += 1
-            coordinator_metrics['last_error'] = f'upload_failed:{sentence_hash}'
-            return False
-
-        if not delete_worker_sqs_message(receipt_handle):
-            coordinator_metrics['idle_tasks_failed'] += 1
-            coordinator_metrics['last_error'] = f'sqs_ack_failed:{sentence_hash}'
-            return False
-
-        coordinator_metrics['idle_tasks_completed'] += 1
-        return True
+        return did_work
     except Exception as e:
         coordinator_metrics['idle_tasks_failed'] += 1
-        coordinator_metrics['last_error'] = f'sqs_worker_error:{str(e)}'
-        print(f"SQS worker task failed: {e}")
+        coordinator_metrics['last_error'] = f'idle task error: {str(e)}'
+        print(f"Idle coordinator task failed: {e}")
         print(traceback.format_exc())
         return False
     finally:
@@ -1110,8 +1271,11 @@ def audio_generation_worker():
             audio_generation_queue.task_done()
 
         except Empty:
-            # Local sentence queue is empty.
-            time.sleep(0.1)
+            # Queue is empty: use spare worker time for coordinator backlog.
+            # Current/nearby sentence work always wins because it is queued first.
+            did_idle_work = process_idle_coordinator_task_once()
+            if not did_idle_work:
+                time.sleep(0.1)
             continue
         except Exception as e:
             if generation_active:
@@ -1142,25 +1306,34 @@ def start_workers_if_needed():
 def should_run_idle_backfill():
     if not WORKER_IDLE_BACKFILL_ENABLED:
         return False
-    if not worker_sqs_enabled or not worker_sqs_client:
-        return False
     if not coordinator_enabled or not get_effective_coordinator_token():
         return False
+    if generation_active:
+        return False
+    try:
+        if not audio_generation_queue.empty():
+            return False
+    except Exception:
+        return False
+
+    with book_jobs_lock:
+        for job in book_jobs.values():
+            if job.get('status') in ('queued', 'running'):
+                return False
     return True
 
 
 def idle_backfill_worker_loop():
-    """Background SQS consumer loop for dumb worker mode."""
+    """Background coordinator backfill when local worker is otherwise idle."""
     while True:
         try:
             if not should_run_idle_backfill():
-                time.sleep(0.5)
+                time.sleep(0.3)
                 continue
 
             did_work = process_idle_coordinator_task_once()
             if not did_work:
-                # receive_message already long-polls; keep additional sleep minimal.
-                time.sleep(0.1)
+                time.sleep(COORDINATOR_IDLE_POLL_INTERVAL)
                 continue
             time.sleep(0.05)
         except Exception as e:
@@ -1170,18 +1343,15 @@ def idle_backfill_worker_loop():
 
 
 def ensure_idle_backfill_thread():
-    global idle_backfill_threads
+    global idle_backfill_thread
 
     if not WORKER_IDLE_BACKFILL_ENABLED:
         return
+    if idle_backfill_thread and idle_backfill_thread.is_alive():
+        return
 
-    idle_backfill_threads = [t for t in idle_backfill_threads if t.is_alive()]
-    missing = max(0, WORKER_SQS_CONCURRENCY - len(idle_backfill_threads))
-
-    for _ in range(missing):
-        thread = threading.Thread(target=idle_backfill_worker_loop, daemon=True)
-        thread.start()
-        idle_backfill_threads.append(thread)
+    idle_backfill_thread = threading.Thread(target=idle_backfill_worker_loop, daemon=True)
+    idle_backfill_thread.start()
 
 
 # -----------------------------------------------------------------------------
@@ -1440,11 +1610,6 @@ def worker_health():
         'service': 'local-audio-worker',
         'coordinator_enabled': coordinator_enabled,
         'coordinator_api_url': COORDINATOR_API_URL or None,
-        'sqs_enabled': worker_sqs_enabled,
-        'sqs_queue_url': WORKER_AUDIO_SQS_QUEUE_URL or None,
-        'sqs_wait_seconds': WORKER_AUDIO_SQS_WAIT_SECONDS,
-        'sqs_visibility_timeout': WORKER_AUDIO_SQS_VISIBILITY_TIMEOUT,
-        'sqs_concurrency': WORKER_SQS_CONCURRENCY,
         'tts_pool_requested': WORKER_TTS_POOL_REQUESTED,
         'tts_pool_size': WORKER_TTS_POOL_SIZE,
         'memory_limit_mb': WORKER_MEMORY_LIMIT_MB,
@@ -1488,8 +1653,8 @@ def worker_jobs():
         queue_size = None
 
     queue_workers_alive = sum(1 for t in audio_generation_threads if t.is_alive())
-    sqs_consumer_alive = sum(1 for t in idle_backfill_threads if t.is_alive())
-    alive_workers = queue_workers_alive + sqs_consumer_alive
+    idle_backfill_alive = bool(idle_backfill_thread and idle_backfill_thread.is_alive())
+    alive_workers = queue_workers_alive + (1 if idle_backfill_alive else 0)
 
     return jsonify({
         'status': 'ok',
@@ -1498,13 +1663,7 @@ def worker_jobs():
         'queue_size': queue_size,
         'alive_workers': alive_workers,
         'queue_workers_alive': queue_workers_alive,
-        'idle_backfill_active': sqs_consumer_alive > 0,
-        'sqs_enabled': worker_sqs_enabled,
-        'sqs_consumer_active': sqs_consumer_alive > 0,
-        'sqs_consumer_threads': sqs_consumer_alive,
-        'sqs_messages_claimed': coordinator_metrics.get('idle_tasks_claimed', 0),
-        'sqs_messages_completed': coordinator_metrics.get('idle_tasks_completed', 0),
-        'sqs_messages_failed': coordinator_metrics.get('idle_tasks_failed', 0),
+        'idle_backfill_active': idle_backfill_alive,
         'summary': {
             'total_jobs': len(snapshots),
             'queued_jobs': status_counts['queued'],
@@ -1691,29 +1850,34 @@ def coordinator_status():
     capture_coordinator_token_from_request()
     has_runtime = bool(get_effective_coordinator_token()) and not bool(COORDINATOR_BEARER_TOKEN)
     has_env_token = bool(COORDINATOR_BEARER_TOKEN)
+    has_worker_secret = bool(WORKER_SHARED_SECRET)
     return jsonify({
         'enabled': coordinator_enabled,
         'api_url': COORDINATOR_API_URL or None,
-        'sqs_enabled': worker_sqs_enabled,
-        'sqs_queue_url': WORKER_AUDIO_SQS_QUEUE_URL or None,
-        'sqs_consumer_threads': sum(1 for t in idle_backfill_threads if t.is_alive()),
         'has_bearer_token': bool(get_effective_coordinator_token()),
+        'has_worker_secret': has_worker_secret,
+        'worker_secret_source': WORKER_SHARED_SECRET_SOURCE,
         'token_source': 'runtime' if has_runtime else ('env' if has_env_token else None),
         'metrics': coordinator_metrics
     })
 
 
+@app.route('/worker/token', methods=['POST'])
+def set_worker_token():
+    """Canonical endpoint for browser -> local worker token sync."""
+    result = apply_worker_token_request()
+    code = 200 if result.get('success') else 400
+    return jsonify(result), code
+
+
 @app.route('/coordinator/token', methods=['POST'])
 def set_coordinator_token():
     """
-    Register Cognito access token for coordinator calls.
-    Accepts bearer token from Authorization header or JSON body.
+    Backward-compatible alias for /worker/token.
     """
-    data = request.json or {}
-    captured = capture_coordinator_token_from_request(data)
-    if not captured:
-        return jsonify({'success': False, 'error': 'Missing bearer token'}), 400
-    return jsonify({'success': True})
+    result = apply_worker_token_request()
+    code = 200 if result.get('success') else 400
+    return jsonify(result), code
 
 
 @app.route('/prioritize', methods=['POST'])
@@ -2136,10 +2300,16 @@ if __name__ == '__main__':
 
     # Bind all interfaces so Docker port mapping can reach the service.
     is_production = os.environ.get('FLASK_ENV', '').lower() == 'production'
-    socketio.run(
-        app,
-        debug=not is_production,
-        host='0.0.0.0',
-        port=5001,
-        allow_unsafe_werkzeug=is_production
-    )
+    run_kwargs = {
+        'debug': not is_production,
+        'host': '0.0.0.0',
+        'port': int(os.environ.get('WORKER_PORT') or os.environ.get('PORT') or '5001'),
+    }
+    if is_production:
+        try:
+            socketio.run(app, allow_unsafe_werkzeug=True, **run_kwargs)
+        except TypeError:
+            # Older Werkzeug/Flask combinations do not accept allow_unsafe_werkzeug.
+            socketio.run(app, **run_kwargs)
+    else:
+        socketio.run(app, **run_kwargs)

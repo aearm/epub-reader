@@ -1,13 +1,14 @@
 # EPUB Reader Deployment Makefile
 # Usage: make <target>
 
-.PHONY: help setup init plan apply deploy deploy-backend deploy-frontend deploy-cloud-worker destroy ssh clean watch-jobs
+.PHONY: help setup init plan apply deploy deploy-backend deploy-frontend deploy-cloud-worker destroy ssh clean watch-jobs worker-up worker-down worker-logs worker-status
 
 # Variables
 TERRAFORM_DIR = terraform
 BACKEND_DIR = backend
 FRONTEND_DIR = frontend
 SSH_KEY_PATH = ~/.ssh/epub_reader
+WORKER_CONTAINERS ?= 1
 
 # Colors
 GREEN = \033[0;32m
@@ -97,7 +98,10 @@ deploy-backend: ## Deploy backend to EC2
 	$(eval AUDIO_SQS_WAIT_SECONDS := $(shell cd $(TERRAFORM_DIR) && terraform output -raw audio_sqs_wait_seconds 2>/dev/null || echo "2"))
 	$(eval AUDIO_SQS_VISIBILITY_TIMEOUT := $(shell cd $(TERRAFORM_DIR) && terraform output -raw audio_sqs_visibility_timeout 2>/dev/null || echo "180"))
 	$(eval AUDIO_SQS_MAX_RECEIVE_COUNT := $(shell cd $(TERRAFORM_DIR) && terraform output -raw audio_sqs_max_receive_count 2>/dev/null || echo "8"))
-	$(eval WORKER_SHARED_SECRET := $(shell cd $(TERRAFORM_DIR) && terraform output -raw worker_shared_secret 2>/dev/null || echo ""))
+	$(eval TF_WORKER_SHARED_SECRET := $(shell cd $(TERRAFORM_DIR) && terraform output -raw worker_shared_secret 2>/dev/null || echo ""))
+	$(eval WORKER_SHARED_SECRET_VALUE := $(if $(strip $(TF_WORKER_SHARED_SECRET)),$(TF_WORKER_SHARED_SECRET),$(WORKER_SHARED_SECRET)))
+	$(eval WORKER_SHARED_SECRET_SECRET_ID_VALUE := $(WORKER_SHARED_SECRET_SECRET_ID))
+	$(eval WORKER_SHARED_SECRET_PARAMETER_NAME_VALUE := $(if $(strip $(WORKER_SHARED_SECRET_PARAMETER_NAME)),$(WORKER_SHARED_SECRET_PARAMETER_NAME),/epub-reader/worker-shared-secret))
 	@if [ -z "$(EC2_IP)" ]; then \
 		echo "Error: Could not get EC2 IP. Run 'make apply' first."; \
 		exit 1; \
@@ -123,7 +127,9 @@ deploy-backend: ## Deploy backend to EC2
 			'AUDIO_SQS_WAIT_SECONDS=$(AUDIO_SQS_WAIT_SECONDS)' \
 			'AUDIO_SQS_VISIBILITY_TIMEOUT=$(AUDIO_SQS_VISIBILITY_TIMEOUT)' \
 			'AUDIO_SQS_MAX_RECEIVE_COUNT=$(AUDIO_SQS_MAX_RECEIVE_COUNT)' \
-			'WORKER_SHARED_SECRET=$(WORKER_SHARED_SECRET)' \
+			'WORKER_SHARED_SECRET=$(WORKER_SHARED_SECRET_VALUE)' \
+			'WORKER_SHARED_SECRET_SECRET_ID=$(WORKER_SHARED_SECRET_SECRET_ID_VALUE)' \
+			'WORKER_SHARED_SECRET_PARAMETER_NAME=$(WORKER_SHARED_SECRET_PARAMETER_NAME_VALUE)' \
 			'OPENAI_API_KEY=$(OPENAI_API_KEY)' \
 			'OPENAI_MODEL=$(OPENAI_MODEL)' \
 			'OPENAI_API_BASE=$(OPENAI_API_BASE)' \
@@ -220,5 +226,23 @@ clean: ## Clean local build artifacts
 	rm -rf __pycache__
 	find . -name "*.pyc" -delete
 
-watch-jobs: ## Watch coordinator jobs-left + current worker jobs (Ctrl+C to stop)
+watch-jobs: ## Watch coordinator/worker/SQS + session ETA (per-message, remaining, total) (Ctrl+C to stop)
 	python3 scripts/watch_audio_jobs.py
+
+worker-up: ## Run local worker stack (usage: make worker-up WORKER_CONTAINERS=4)
+	@if [ "$(WORKER_CONTAINERS)" -lt 1 ]; then \
+		echo "WORKER_CONTAINERS must be >= 1"; \
+		exit 1; \
+	fi
+	@echo "$(YELLOW)Starting local worker API + $(WORKER_CONTAINERS) worker container(s)...$(NC)"
+	docker compose --profile workers up -d --build --scale epub-reader-worker=$(WORKER_CONTAINERS) epub-reader epub-reader-worker
+	@echo "$(GREEN)Workers started. Token sync endpoint: http://127.0.0.1:5001/worker/token$(NC)"
+
+worker-down: ## Stop local worker containers
+	docker compose --profile workers stop epub-reader epub-reader-worker
+
+worker-logs: ## Tail API worker logs
+	docker compose logs -f epub-reader
+
+worker-status: ## Show local worker containers
+	docker compose --profile workers ps
