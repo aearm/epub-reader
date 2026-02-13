@@ -1,5 +1,11 @@
 # EPUB Reader with Text-to-Speech
 
+## Frontend Status
+
+- Supported frontend: `calm-reader/` (React app).
+- Deprecated frontend paths: `frontend/`, `templates/index_async.html`, and worker-served legacy UI routes.
+- `app_multithreaded.py` now runs as worker/backend API only and no longer serves the legacy reader template.
+
 A web-based EPUB reader that converts text to speech using the Kokoro TTS model. Click any sentence to hear it read aloud with support for auto-play and playback controls.
 
 ## Features

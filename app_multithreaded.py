@@ -1,5 +1,5 @@
 # app_multithreaded.py
-from flask import Flask, render_template, request, jsonify, send_file, redirect
+from flask import Flask, request, jsonify, send_file, redirect
 from flask_cors import CORS
 from flask_socketio import SocketIO, emit
 import os
@@ -1359,8 +1359,11 @@ def ensure_idle_backfill_thread():
 # -----------------------------------------------------------------------------
 @app.route('/')
 def index():
-    """Serve main reader UI."""
-    return render_template('index_async.html')
+    """Legacy UI endpoint (deprecated)."""
+    return jsonify({
+        'status': 'deprecated',
+        'message': 'Legacy template frontend is deprecated. Use the calm-reader frontend deployment.'
+    }), 410
 
 
 @app.route('/upload', methods=['POST'])
