@@ -81,7 +81,9 @@ Coordinator SQS queue options (single queue mode):
 
 Coordinator AI chat options:
 - `OPENAI_API_KEY` (required to enable per-book AI discussion)
-- `OPENAI_MODEL` (optional, default `gpt-4o-mini`)
+- `OPENAI_MODEL` (optional global fallback, default `gpt-4o-mini`)
+- `OPENAI_CHAT_MODEL` (optional, overrides chat/simplify/Q&A model)
+- `OPENAI_TRANSLATION_MODEL` (optional, overrides translation model)
 - `OPENAI_API_BASE` (optional, default `https://api.openai.com/v1`)
 
 ## Run Local Worker (Docker)

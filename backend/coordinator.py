@@ -30,6 +30,7 @@ from functools import wraps
 from jose import jwt, JWTError
 import requests
 from urllib.parse import unquote, urlparse
+from openai import OpenAI
 
 app = Flask(__name__)
 CORS(app, origins=[
@@ -69,6 +70,21 @@ AUDIO_GENERATING_STALE_SECONDS = max(
     int(os.environ.get('AUDIO_GENERATING_STALE_SECONDS', str(AUDIO_SQS_VISIBILITY_TIMEOUT)))
 )
 GENERATE_AUDIO_DB_BATCH_SIZE = max(50, int(os.environ.get('GENERATE_AUDIO_DB_BATCH_SIZE', '250')))
+OPENAI_API_KEY = (os.environ.get('OPENAI_API_KEY') or '').strip()
+OPENAI_API_BASE = (os.environ.get('OPENAI_API_BASE') or 'https://api.openai.com/v1').strip()
+OPENAI_CHAT_MODEL = (
+    (os.environ.get('OPENAI_CHAT_MODEL') or '').strip()
+    or (os.environ.get('OPENAI_MODEL') or '').strip()
+    or 'gpt-4o-mini'
+)
+OPENAI_TRANSLATION_MODEL = (
+    (os.environ.get('OPENAI_TRANSLATION_MODEL') or '').strip()
+    or (os.environ.get('OPENAI_MODEL') or '').strip()
+    or OPENAI_CHAT_MODEL
+)
+OPENAI_TIMEOUT_SECONDS = max(5.0, float(os.environ.get('OPENAI_TIMEOUT_SECONDS', '25')))
+OPENAI_CHAT_HISTORY_LIMIT = max(6, int(os.environ.get('OPENAI_CHAT_HISTORY_LIMIT', '24')))
+OPENAI_MAX_REPLY_CHARS = max(400, int(os.environ.get('OPENAI_MAX_REPLY_CHARS', '6000')))
 
 
 def _extract_worker_shared_secret(value):
@@ -155,6 +171,19 @@ active_generation_lock = threading.Lock()
 kokoro_lock = threading.Lock()
 kokoro_engine = None
 kokoro_voice = KOKORO_VOICE
+openai_client = None
+
+if OPENAI_API_KEY:
+    try:
+        if OPENAI_API_BASE:
+            openai_client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_API_BASE, timeout=OPENAI_TIMEOUT_SECONDS)
+        else:
+            openai_client = OpenAI(api_key=OPENAI_API_KEY, timeout=OPENAI_TIMEOUT_SECONDS)
+    except Exception as e:
+        openai_client = None
+        print(f"WARNING: OpenAI client init failed: {e}")
+else:
+    print("INFO: OPENAI_API_KEY is not set; chat and translation APIs will return 503 until configured.")
 
 
 def get_db():
@@ -328,6 +357,19 @@ def init_db():
             PRIMARY KEY(club_id, user_id)
         )
     ''')
+    db.execute('''
+        CREATE TABLE IF NOT EXISTS book_chat_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            book_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            chapter_id TEXT,
+            sentence_index INTEGER,
+            quote TEXT,
+            created_at REAL NOT NULL
+        )
+    ''')
     db.execute('CREATE INDEX IF NOT EXISTS idx_status ON audio_index(status)')
     db.execute('CREATE INDEX IF NOT EXISTS idx_audio_index_claimed_at ON audio_index(claimed_at)')
     db.execute('CREATE INDEX IF NOT EXISTS idx_user_books_user_last_opened ON user_books(user_id, last_opened DESC)')
@@ -338,6 +380,7 @@ def init_db():
     db.execute('CREATE INDEX IF NOT EXISTS idx_club_posts_club_created ON club_posts(club_id, created_at DESC)')
     db.execute('CREATE INDEX IF NOT EXISTS idx_club_threads_club_book ON club_threads(club_id, book_id)')
     db.execute('CREATE INDEX IF NOT EXISTS idx_club_thread_messages_thread_created ON club_thread_messages(thread_id, created_at ASC)')
+    db.execute('CREATE INDEX IF NOT EXISTS idx_book_chat_messages_book_created ON book_chat_messages(user_id, book_id, created_at ASC)')
 
     # Migrate older databases in place.
     existing_audio_cols = {
@@ -585,6 +628,184 @@ def safe_json_load(value, default):
     except Exception:
         return default
     return parsed if parsed is not None else default
+
+
+LANGUAGE_NAMES = {
+    'auto': 'auto-detect',
+    'en': 'English',
+    'es': 'Spanish',
+    'fr': 'French',
+    'de': 'German',
+    'it': 'Italian',
+    'pt': 'Portuguese',
+    'zh': 'Chinese',
+    'ja': 'Japanese',
+    'ko': 'Korean',
+    'ar': 'Arabic',
+    'ru': 'Russian',
+    'hi': 'Hindi',
+    'tr': 'Turkish',
+}
+
+
+def normalize_language_code(value, default='auto'):
+    code = str(value or '').strip().lower()
+    if not code:
+        return default
+    return code
+
+
+def language_name(code):
+    key = normalize_language_code(code, 'auto')
+    return LANGUAGE_NAMES.get(key, key or 'auto-detect')
+
+
+def require_openai():
+    if not OPENAI_API_KEY or openai_client is None:
+        raise RuntimeError('OpenAI is not configured on backend. Missing OPENAI_API_KEY.')
+    return openai_client
+
+
+def extract_openai_text(response):
+    try:
+        choices = getattr(response, 'choices', None) or []
+        if not choices:
+            return ''
+        message = getattr(choices[0], 'message', None)
+        if not message:
+            return ''
+        content = getattr(message, 'content', '')
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                text = getattr(item, 'text', None) if not isinstance(item, dict) else item.get('text')
+                if isinstance(text, str) and text.strip():
+                    parts.append(text.strip())
+            return '\n'.join(parts).strip()
+        return str(content or '').strip()
+    except Exception:
+        return ''
+
+
+def openai_chat_completion(messages, model, temperature=0.3):
+    client = require_openai()
+    response = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=temperature,
+    )
+    text = extract_openai_text(response)
+    used_model = getattr(response, 'model', None) or model
+    if not text:
+        raise RuntimeError('OpenAI returned an empty response.')
+    return text, used_model
+
+
+def serialize_book_chat_row(row):
+    return {
+        'id': int(row['id']),
+        'role': row['role'],
+        'content': row['content'] or '',
+        'created_at': parse_float(row['created_at'], time.time()),
+    }
+
+
+def fetch_book_chat_messages(db, user_id, book_id, limit=80):
+    safe_limit = max(1, min(parse_int(limit, 80), 500))
+    rows = db.execute(
+        '''
+        SELECT id, role, content, created_at
+        FROM book_chat_messages
+        WHERE user_id = ? AND book_id = ?
+        ORDER BY id DESC
+        LIMIT ?
+        ''',
+        (user_id, book_id, safe_limit)
+    ).fetchall()
+    ordered = list(reversed(rows))
+    return [serialize_book_chat_row(row) for row in ordered]
+
+
+def build_reader_assistant_system_prompt():
+    return (
+        "You are a careful reading assistant. Prioritize clarity, correctness, and concise explanations. "
+        "When useful, simplify difficult text into plain language without losing meaning. "
+        "If the user asks for summary, produce structured bullets. "
+        "If asked for flashcards, return concise Q/A pairs. "
+        "If asked for counter-argument, provide balanced critique. "
+        "Never invent facts from outside the provided text context."
+    )
+
+
+def build_chat_messages_for_model(db, user_id, book_id, user_message, context):
+    history_rows = db.execute(
+        '''
+        SELECT role, content
+        FROM book_chat_messages
+        WHERE user_id = ? AND book_id = ? AND role IN ('user', 'assistant')
+        ORDER BY id DESC
+        LIMIT ?
+        ''',
+        (user_id, book_id, OPENAI_CHAT_HISTORY_LIMIT)
+    ).fetchall()
+    history = list(reversed(history_rows))
+    messages = [{'role': 'system', 'content': build_reader_assistant_system_prompt()}]
+
+    if isinstance(context, dict):
+        chapter_id = str(context.get('chapter_id') or context.get('chapterId') or '').strip()
+        sentence_index = parse_int(context.get('sentence_index') or context.get('sentenceIndex'), -1)
+        quote = str(context.get('quote') or '').strip()
+        if chapter_id or sentence_index >= 0 or quote:
+            context_lines = ['Reading context:']
+            if chapter_id:
+                context_lines.append(f"- chapter_id: {chapter_id}")
+            if sentence_index >= 0:
+                context_lines.append(f"- sentence_index: {sentence_index}")
+            if quote:
+                context_lines.append(f"- passage: {quote}")
+            messages.append({'role': 'system', 'content': '\n'.join(context_lines)})
+
+    for row in history:
+        role = row['role']
+        content = (row['content'] or '').strip()
+        if role not in ('user', 'assistant') or not content:
+            continue
+        messages.append({'role': role, 'content': content})
+
+    messages.append({'role': 'user', 'content': user_message})
+    return messages
+
+
+def translate_with_openai(text, target_lang, source_lang='auto'):
+    cleaned = (text or '').strip()
+    if not cleaned:
+        raise ValueError('Missing text')
+    target_code = normalize_language_code(target_lang, 'en')
+    source_code = normalize_language_code(source_lang, 'auto')
+    source_name = language_name(source_code)
+    target_name = language_name(target_code)
+
+    prompt = (
+        f"Translate the text from {source_name} to {target_name}. "
+        "Return only the translated sentence, no explanation.\n\n"
+        f"Text:\n{cleaned}"
+    )
+    translated, used_model = openai_chat_completion(
+        messages=[
+            {'role': 'system', 'content': 'You are a precise translator.'},
+            {'role': 'user', 'content': prompt},
+        ],
+        model=OPENAI_TRANSLATION_MODEL,
+        temperature=0.1,
+    )
+    return {
+        'translated_text': translated.strip(),
+        'target_language': target_code,
+        'source_language': source_code,
+        'model': used_model,
+    }
 
 
 def _default_member_notifications():
@@ -2478,6 +2699,181 @@ def delete_user_book(book_id):
     )
     db.commit()
     return jsonify({'status': 'ok'})
+
+
+@app.route('/translate', methods=['POST'])
+@require_auth
+def translate_text():
+    payload = request.get_json(silent=True)
+    data = payload if isinstance(payload, dict) else {}
+    text = str(data.get('text') or '').strip()
+    if not text:
+        return jsonify({'error': 'Missing text'}), 400
+
+    if len(text) > 12000:
+        return jsonify({'error': 'Text is too long'}), 400
+
+    target_language = normalize_language_code(
+        data.get('target_language') or data.get('targetLanguage'),
+        'en'
+    )
+    source_language = normalize_language_code(
+        data.get('source_language') or data.get('sourceLanguage'),
+        'auto'
+    )
+
+    try:
+        result = translate_with_openai(text, target_language, source_language)
+        return jsonify({
+            'translated_text': result.get('translated_text', ''),
+            'target_language': result.get('target_language', target_language),
+            'source_language': result.get('source_language', source_language),
+            'model': result.get('model'),
+        })
+    except RuntimeError as e:
+        message = str(e)
+        code = 503 if 'not configured' in message.lower() else 502
+        return jsonify({'error': message}), code
+    except Exception as e:
+        return jsonify({'error': f'Translation failed: {str(e)}'}), 500
+
+
+@app.route('/books/<book_id>/chat_history', methods=['GET'])
+@require_auth
+def get_book_chat_history(book_id):
+    user_id = get_current_user_id()
+    normalized_book_id = normalize_book_id(book_id)
+    if not normalized_book_id:
+        return jsonify({'error': 'Invalid book_id'}), 400
+
+    db = get_db()
+    exists = db.execute(
+        'SELECT 1 FROM user_books WHERE user_id = ? AND book_id = ?',
+        (user_id, normalized_book_id)
+    ).fetchone()
+    if not exists:
+        return jsonify({'error': 'Book not found'}), 404
+
+    limit = parse_int(request.args.get('limit'), 80)
+    messages = fetch_book_chat_messages(db, user_id, normalized_book_id, limit=limit)
+    return jsonify({
+        'book_id': normalized_book_id,
+        'messages': messages,
+    })
+
+
+@app.route('/books/<book_id>/chat', methods=['POST'])
+@require_auth
+def send_book_chat_message(book_id):
+    user_id = get_current_user_id()
+    normalized_book_id = normalize_book_id(book_id)
+    if not normalized_book_id:
+        return jsonify({'error': 'Invalid book_id'}), 400
+
+    db = get_db()
+    exists = db.execute(
+        'SELECT 1 FROM user_books WHERE user_id = ? AND book_id = ?',
+        (user_id, normalized_book_id)
+    ).fetchone()
+    if not exists:
+        return jsonify({'error': 'Book not found'}), 404
+
+    payload = request.get_json(silent=True)
+    data = payload if isinstance(payload, dict) else {}
+    message = str(data.get('message') or '').strip()
+    if not message:
+        return jsonify({'error': 'Missing message'}), 400
+    if len(message) > 12000:
+        return jsonify({'error': 'Message is too long'}), 400
+
+    raw_context = data.get('context') if isinstance(data.get('context'), dict) else {}
+    chapter_id = str(raw_context.get('chapter_id') or raw_context.get('chapterId') or '').strip() or None
+    sentence_index = parse_int(raw_context.get('sentence_index') or raw_context.get('sentenceIndex'), -1)
+    if sentence_index < 0:
+        sentence_index = None
+    quote = str(raw_context.get('quote') or '').strip()
+    if len(quote) > 12000:
+        quote = quote[:12000]
+    if not quote:
+        quote = None
+
+    context_payload = {
+        'chapter_id': chapter_id,
+        'sentence_index': sentence_index,
+        'quote': quote,
+    }
+    model_messages = build_chat_messages_for_model(db, user_id, normalized_book_id, message, context_payload)
+
+    now = time.time()
+    db.execute(
+        '''
+        INSERT INTO book_chat_messages (user_id, book_id, role, content, chapter_id, sentence_index, quote, created_at)
+        VALUES (?, ?, 'user', ?, ?, ?, ?, ?)
+        ''',
+        (user_id, normalized_book_id, message, chapter_id, sentence_index, quote, now)
+    )
+    db.commit()
+
+    try:
+        assistant_reply, used_model = openai_chat_completion(
+            messages=model_messages,
+            model=OPENAI_CHAT_MODEL,
+            temperature=0.4,
+        )
+    except RuntimeError as e:
+        message_text = str(e)
+        code = 503 if 'not configured' in message_text.lower() else 502
+        return jsonify({'error': message_text}), code
+    except Exception as e:
+        return jsonify({'error': f'AI request failed: {str(e)}'}), 500
+
+    cleaned_reply = (assistant_reply or '').strip()
+    if len(cleaned_reply) > OPENAI_MAX_REPLY_CHARS:
+        cleaned_reply = cleaned_reply[:OPENAI_MAX_REPLY_CHARS].rstrip()
+
+    db.execute(
+        '''
+        INSERT INTO book_chat_messages (user_id, book_id, role, content, chapter_id, sentence_index, quote, created_at)
+        VALUES (?, ?, 'assistant', ?, ?, ?, ?, ?)
+        ''',
+        (user_id, normalized_book_id, cleaned_reply, chapter_id, sentence_index, quote, time.time())
+    )
+    db.commit()
+
+    messages = fetch_book_chat_messages(db, user_id, normalized_book_id, limit=80)
+    return jsonify({
+        'book_id': normalized_book_id,
+        'reply': cleaned_reply,
+        'model': used_model,
+        'messages': messages,
+    })
+
+
+@app.route('/books/<book_id>/chat_history', methods=['DELETE'])
+@require_auth
+def clear_book_chat_history(book_id):
+    user_id = get_current_user_id()
+    normalized_book_id = normalize_book_id(book_id)
+    if not normalized_book_id:
+        return jsonify({'error': 'Invalid book_id'}), 400
+
+    db = get_db()
+    exists = db.execute(
+        'SELECT 1 FROM user_books WHERE user_id = ? AND book_id = ?',
+        (user_id, normalized_book_id)
+    ).fetchone()
+    if not exists:
+        return jsonify({'error': 'Book not found'}), 404
+
+    cursor = db.execute(
+        'DELETE FROM book_chat_messages WHERE user_id = ? AND book_id = ?',
+        (user_id, normalized_book_id)
+    )
+    db.commit()
+    return jsonify({
+        'ok': True,
+        'cleared': int(cursor.rowcount or 0),
+    })
 
 
 @app.route('/books/<book_id>/generate_audio', methods=['POST'])
