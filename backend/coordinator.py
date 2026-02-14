@@ -33,11 +33,17 @@ from urllib.parse import unquote, urlparse
 from openai import OpenAI
 
 app = Flask(__name__)
-CORS(app, origins=[
+ALLOWED_CORS_ORIGINS = {
     "https://reader.psybytes.com",
     "http://localhost:5001",
-    "http://localhost:3000"
-])
+    "http://localhost:3000",
+}
+CORS(
+    app,
+    origins=list(ALLOWED_CORS_ORIGINS),
+    allow_headers=['Authorization', 'Content-Type'],
+    methods=['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']
+)
 
 # Configuration from environment
 AUDIO_BUCKET = os.environ.get('AUDIO_BUCKET', 'epub-reader-audio')
@@ -184,6 +190,17 @@ if OPENAI_API_KEY:
         print(f"WARNING: OpenAI client init failed: {e}")
 else:
     print("INFO: OPENAI_API_KEY is not set; chat and translation APIs will return 503 until configured.")
+
+
+@app.after_request
+def ensure_cors_headers(response):
+    origin = (request.headers.get('Origin') or '').strip()
+    if origin in ALLOWED_CORS_ORIGINS:
+        response.headers['Access-Control-Allow-Origin'] = origin
+        response.headers['Vary'] = 'Origin'
+        response.headers['Access-Control-Allow-Headers'] = 'Authorization, Content-Type'
+        response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, PATCH, DELETE, OPTIONS'
+    return response
 
 
 def get_db():
