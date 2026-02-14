@@ -10,6 +10,12 @@ FRONTEND_DIR = frontend
 SSH_KEY_PATH = ~/.ssh/epub_reader
 WORKER_CONTAINERS ?= 1
 
+# Load local environment overrides from root .env when present.
+ifneq (,$(wildcard .env))
+include .env
+export
+endif
+
 # Colors
 GREEN = \033[0;32m
 YELLOW = \033[1;33m
@@ -138,7 +144,7 @@ deploy-backend: ## Deploy backend to EC2
 			> /opt/epub-reader/.env"
 	@echo "Setting up Python environment..."
 	ssh -i $(SSH_KEY_PATH) ec2-user@$(EC2_IP) \
-		"cd /opt/epub-reader && python3 -m venv venv 2>/dev/null || true && source venv/bin/activate && pip install -r requirements.txt"
+		"cd /opt/epub-reader && python3 -m venv venv 2>/dev/null || true && ./venv/bin/python -m pip install -r requirements.txt"
 	@echo "Restarting coordinator service..."
 	ssh -i $(SSH_KEY_PATH) ec2-user@$(EC2_IP) \
 		"sudo systemctl restart coordinator || echo 'Service not configured yet'"
