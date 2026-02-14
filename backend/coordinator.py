@@ -30,7 +30,10 @@ from functools import wraps
 from jose import jwt, JWTError
 import requests
 from urllib.parse import unquote, urlparse
-from openai import OpenAI
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None
 
 app = Flask(__name__)
 ALLOWED_CORS_ORIGINS = {
@@ -179,7 +182,7 @@ kokoro_engine = None
 kokoro_voice = KOKORO_VOICE
 openai_client = None
 
-if OPENAI_API_KEY:
+if OPENAI_API_KEY and OpenAI is not None:
     try:
         if OPENAI_API_BASE:
             openai_client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_API_BASE, timeout=OPENAI_TIMEOUT_SECONDS)
@@ -189,7 +192,10 @@ if OPENAI_API_KEY:
         openai_client = None
         print(f"WARNING: OpenAI client init failed: {e}")
 else:
-    print("INFO: OPENAI_API_KEY is not set; chat and translation APIs will return 503 until configured.")
+    if OpenAI is None:
+        print("WARNING: openai package not installed; chat and translation APIs will return 503 until installed.")
+    else:
+        print("INFO: OPENAI_API_KEY is not set; chat and translation APIs will return 503 until configured.")
 
 
 @app.after_request
