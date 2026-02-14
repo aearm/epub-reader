@@ -24,16 +24,13 @@ import wave
 from array import array
 from datetime import datetime, timezone
 from botocore.config import Config
+from botocore.exceptions import BotoCoreError, ClientError
 from flask import Flask, request, jsonify, g, Response, stream_with_context
 from flask_cors import CORS
 from functools import wraps
 from jose import jwt, JWTError
 import requests
 from urllib.parse import unquote, urlparse
-try:
-    from openai import OpenAI
-except Exception:
-    OpenAI = None
 
 app = Flask(__name__)
 ALLOWED_CORS_ORIGINS = {
@@ -79,21 +76,26 @@ AUDIO_GENERATING_STALE_SECONDS = max(
     int(os.environ.get('AUDIO_GENERATING_STALE_SECONDS', str(AUDIO_SQS_VISIBILITY_TIMEOUT)))
 )
 GENERATE_AUDIO_DB_BATCH_SIZE = max(50, int(os.environ.get('GENERATE_AUDIO_DB_BATCH_SIZE', '250')))
-OPENAI_API_KEY = (os.environ.get('OPENAI_API_KEY') or '').strip()
-OPENAI_API_BASE = (os.environ.get('OPENAI_API_BASE') or 'https://api.openai.com/v1').strip()
-OPENAI_CHAT_MODEL = (
-    (os.environ.get('OPENAI_CHAT_MODEL') or '').strip()
-    or (os.environ.get('OPENAI_MODEL') or '').strip()
-    or 'gpt-4o-mini'
+BEDROCK_REGION = (os.environ.get('BEDROCK_REGION') or AWS_REGION or 'us-east-1').strip()
+BEDROCK_MODEL_ID = (
+    (os.environ.get('BEDROCK_CHAT_MODEL_ID') or '').strip()
+    or (os.environ.get('BEDROCK_MODEL_ID') or '').strip()
+    or 'anthropic.claude-3-5-haiku-20241022-v1:0'
 )
-OPENAI_TRANSLATION_MODEL = (
-    (os.environ.get('OPENAI_TRANSLATION_MODEL') or '').strip()
-    or (os.environ.get('OPENAI_MODEL') or '').strip()
-    or OPENAI_CHAT_MODEL
+BEDROCK_TRANSLATION_MODEL_ID = (
+    (os.environ.get('BEDROCK_TRANSLATION_MODEL_ID') or '').strip()
+    or (os.environ.get('BEDROCK_MODEL_ID') or '').strip()
+    or BEDROCK_MODEL_ID
 )
-OPENAI_TIMEOUT_SECONDS = max(5.0, float(os.environ.get('OPENAI_TIMEOUT_SECONDS', '25')))
-OPENAI_CHAT_HISTORY_LIMIT = max(6, int(os.environ.get('OPENAI_CHAT_HISTORY_LIMIT', '24')))
-OPENAI_MAX_REPLY_CHARS = max(400, int(os.environ.get('OPENAI_MAX_REPLY_CHARS', '6000')))
+BEDROCK_TIMEOUT_SECONDS = max(5.0, float(os.environ.get('BEDROCK_TIMEOUT_SECONDS', '25')))
+AI_CHAT_HISTORY_LIMIT = max(
+    6,
+    int((os.environ.get('AI_CHAT_HISTORY_LIMIT') or os.environ.get('OPENAI_CHAT_HISTORY_LIMIT') or '24'))
+)
+AI_MAX_REPLY_CHARS = max(
+    400,
+    int((os.environ.get('AI_MAX_REPLY_CHARS') or os.environ.get('OPENAI_MAX_REPLY_CHARS') or '6000'))
+)
 
 
 def _extract_worker_shared_secret(value):
@@ -180,22 +182,23 @@ active_generation_lock = threading.Lock()
 kokoro_lock = threading.Lock()
 kokoro_engine = None
 kokoro_voice = KOKORO_VOICE
-openai_client = None
-
-if OPENAI_API_KEY and OpenAI is not None:
+bedrock_runtime_client = None
+if BEDROCK_MODEL_ID:
     try:
-        if OPENAI_API_BASE:
-            openai_client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_API_BASE, timeout=OPENAI_TIMEOUT_SECONDS)
-        else:
-            openai_client = OpenAI(api_key=OPENAI_API_KEY, timeout=OPENAI_TIMEOUT_SECONDS)
+        bedrock_runtime_client = boto3.client(
+            'bedrock-runtime',
+            region_name=BEDROCK_REGION,
+            config=Config(
+                connect_timeout=BEDROCK_TIMEOUT_SECONDS,
+                read_timeout=BEDROCK_TIMEOUT_SECONDS,
+                retries={'max_attempts': 2}
+            )
+        )
     except Exception as e:
-        openai_client = None
-        print(f"WARNING: OpenAI client init failed: {e}")
+        bedrock_runtime_client = None
+        print(f"WARNING: Bedrock runtime client init failed: {e}")
 else:
-    if OpenAI is None:
-        print("WARNING: openai package not installed; chat and translation APIs will return 503 until installed.")
-    else:
-        print("INFO: OPENAI_API_KEY is not set; chat and translation APIs will return 503 until configured.")
+    print("INFO: BEDROCK_MODEL_ID is not set; chat and translation APIs will return 503 until configured.")
 
 
 @app.after_request
@@ -325,6 +328,15 @@ def init_db():
         )
     ''')
     db.execute('''
+        CREATE TABLE IF NOT EXISTS club_shared_books (
+            club_id TEXT NOT NULL,
+            book_id TEXT NOT NULL,
+            added_by_user_id TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            PRIMARY KEY(club_id, book_id)
+        )
+    ''')
+    db.execute('''
         CREATE TABLE IF NOT EXISTS club_posts (
             id TEXT PRIMARY KEY,
             club_id TEXT NOT NULL,
@@ -400,6 +412,7 @@ def init_db():
     db.execute('CREATE INDEX IF NOT EXISTS idx_book_audio_hash ON book_audio(hash)')
     db.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_clubs_invite_code ON clubs(invite_code)')
     db.execute('CREATE INDEX IF NOT EXISTS idx_club_members_user ON club_members(user_id)')
+    db.execute('CREATE INDEX IF NOT EXISTS idx_club_shared_books_club_created ON club_shared_books(club_id, created_at DESC)')
     db.execute('CREATE INDEX IF NOT EXISTS idx_club_posts_club_created ON club_posts(club_id, created_at DESC)')
     db.execute('CREATE INDEX IF NOT EXISTS idx_club_threads_club_book ON club_threads(club_id, book_id)')
     db.execute('CREATE INDEX IF NOT EXISTS idx_club_thread_messages_thread_created ON club_thread_messages(thread_id, created_at ASC)')
@@ -419,6 +432,22 @@ def init_db():
         db.execute("ALTER TABLE audio_index ADD COLUMN attempt_count INTEGER DEFAULT 0")
     if 'error' not in existing_audio_cols:
         db.execute("ALTER TABLE audio_index ADD COLUMN error TEXT")
+
+    # Backfill the existing single active book into multi-share list for older clubs.
+    db.execute(
+        '''
+        INSERT OR IGNORE INTO club_shared_books (club_id, book_id, added_by_user_id, created_at)
+        SELECT
+            id,
+            active_book_id,
+            owner_user_id,
+            COALESCE(updated_at, created_at, ?)
+        FROM clubs
+        WHERE active_book_id IS NOT NULL
+          AND TRIM(active_book_id) != ''
+        ''',
+        (time.time(),)
+    )
 
     db.commit()
     db.close()
@@ -683,47 +712,118 @@ def language_name(code):
     return LANGUAGE_NAMES.get(key, key or 'auto-detect')
 
 
-def require_openai():
-    if not OPENAI_API_KEY or openai_client is None:
-        raise RuntimeError('OpenAI is not configured on backend. Missing OPENAI_API_KEY.')
-    return openai_client
+def require_bedrock():
+    if not BEDROCK_MODEL_ID:
+        raise RuntimeError('Bedrock is not configured on backend. Missing BEDROCK_MODEL_ID.')
+    if bedrock_runtime_client is None:
+        raise RuntimeError('Bedrock runtime client is unavailable. Check AWS credentials and BEDROCK_REGION.')
+    return bedrock_runtime_client
 
 
-def extract_openai_text(response):
-    try:
-        choices = getattr(response, 'choices', None) or []
-        if not choices:
-            return ''
-        message = getattr(choices[0], 'message', None)
-        if not message:
-            return ''
-        content = getattr(message, 'content', '')
-        if isinstance(content, str):
-            return content.strip()
+def _coerce_message_text(content):
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                text = item.get('text')
+                if isinstance(text, str) and text.strip():
+                    parts.append(text.strip())
+            else:
+                text = getattr(item, 'text', None)
+                if isinstance(text, str) and text.strip():
+                    parts.append(text.strip())
+        return '\n'.join(parts).strip()
+    if content is None:
+        return ''
+    return str(content).strip()
+
+
+def _messages_to_bedrock(messages):
+    system_parts = []
+    conversation = []
+
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get('role') or '').strip().lower()
+        text = _coerce_message_text(message.get('content'))
+        if not text:
+            continue
+        if role == 'system':
+            system_parts.append(text)
+            continue
+        if role not in ('user', 'assistant'):
+            continue
+        conversation.append({
+            'role': role,
+            'content': [{'type': 'text', 'text': text}],
+        })
+
+    if not conversation:
+        raise RuntimeError('No conversation messages were provided for AI completion.')
+
+    return '\n\n'.join(system_parts).strip(), conversation
+
+
+def extract_bedrock_text(raw_response_body):
+    body = raw_response_body
+    if hasattr(body, 'read'):
+        body = body.read()
+    if isinstance(body, bytes):
+        body = body.decode('utf-8', errors='ignore')
+    if isinstance(body, str):
+        body = json.loads(body)
+
+    if isinstance(body, dict):
+        content = body.get('content')
         if isinstance(content, list):
             parts = []
             for item in content:
-                text = getattr(item, 'text', None) if not isinstance(item, dict) else item.get('text')
+                if not isinstance(item, dict):
+                    continue
+                if item.get('type') != 'text':
+                    continue
+                text = item.get('text')
                 if isinstance(text, str) and text.strip():
                     parts.append(text.strip())
-            return '\n'.join(parts).strip()
-        return str(content or '').strip()
-    except Exception:
-        return ''
+            if parts:
+                return '\n'.join(parts).strip()
+        output_text = body.get('output_text')
+        if isinstance(output_text, str) and output_text.strip():
+            return output_text.strip()
+    return ''
 
 
-def openai_chat_completion(messages, model, temperature=0.3):
-    client = require_openai()
-    response = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        temperature=temperature,
-    )
-    text = extract_openai_text(response)
-    used_model = getattr(response, 'model', None) or model
+def bedrock_chat_completion(messages, model, temperature=0.3, max_tokens=1200):
+    client = require_bedrock()
+    system_prompt, conversation = _messages_to_bedrock(messages)
+    payload = {
+        'anthropic_version': 'bedrock-2023-05-31',
+        'max_tokens': max(128, min(parse_int(max_tokens, 1200), 4096)),
+        'temperature': max(0.0, min(parse_float(temperature, 0.3), 1.0)),
+        'messages': conversation,
+    }
+    if system_prompt:
+        payload['system'] = system_prompt
+
+    try:
+        response = client.invoke_model(
+            modelId=model,
+            contentType='application/json',
+            accept='application/json',
+            body=json.dumps(payload).encode('utf-8'),
+        )
+    except (ClientError, BotoCoreError) as e:
+        raise RuntimeError(f'Bedrock request failed: {str(e)}')
+    except Exception as e:
+        raise RuntimeError(f'Bedrock invocation failed: {str(e)}')
+
+    text = extract_bedrock_text(response.get('body'))
     if not text:
-        raise RuntimeError('OpenAI returned an empty response.')
-    return text, used_model
+        raise RuntimeError('Bedrock returned an empty response.')
+    return text, model
 
 
 def serialize_book_chat_row(row):
@@ -771,7 +871,7 @@ def build_chat_messages_for_model(db, user_id, book_id, user_message, context):
         ORDER BY id DESC
         LIMIT ?
         ''',
-        (user_id, book_id, OPENAI_CHAT_HISTORY_LIMIT)
+        (user_id, book_id, AI_CHAT_HISTORY_LIMIT)
     ).fetchall()
     history = list(reversed(history_rows))
     messages = [{'role': 'system', 'content': build_reader_assistant_system_prompt()}]
@@ -801,7 +901,7 @@ def build_chat_messages_for_model(db, user_id, book_id, user_message, context):
     return messages
 
 
-def translate_with_openai(text, target_lang, source_lang='auto'):
+def translate_with_bedrock(text, target_lang, source_lang='auto'):
     cleaned = (text or '').strip()
     if not cleaned:
         raise ValueError('Missing text')
@@ -815,13 +915,14 @@ def translate_with_openai(text, target_lang, source_lang='auto'):
         "Return only the translated sentence, no explanation.\n\n"
         f"Text:\n{cleaned}"
     )
-    translated, used_model = openai_chat_completion(
+    translated, used_model = bedrock_chat_completion(
         messages=[
             {'role': 'system', 'content': 'You are a precise translator.'},
             {'role': 'user', 'content': prompt},
         ],
-        model=OPENAI_TRANSLATION_MODEL,
+        model=BEDROCK_TRANSLATION_MODEL_ID,
         temperature=0.1,
+        max_tokens=1000,
     )
     return {
         'translated_text': translated.strip(),
@@ -910,6 +1011,164 @@ def serialize_club_member(row):
     }
 
 
+def list_club_shared_book_ids(db, club_id):
+    rows = db.execute(
+        '''
+        SELECT book_id
+        FROM club_shared_books
+        WHERE club_id = ?
+        ORDER BY created_at ASC
+        ''',
+        (club_id,)
+    ).fetchall()
+    shared_ids = []
+    for item in rows:
+        book_id = str(item['book_id'] or '').strip()
+        if book_id:
+            shared_ids.append(book_id)
+    return shared_ids
+
+
+def provision_book_from_owner_to_member(db, owner_user_id, member_user_id, book_id):
+    owner_user_id = str(owner_user_id or '').strip()
+    member_user_id = str(member_user_id or '').strip()
+    book_id = normalize_book_id(book_id)
+    if not owner_user_id or not member_user_id or not book_id:
+        return False
+    if owner_user_id == member_user_id:
+        return False
+
+    source_book_exists = db.execute(
+        'SELECT 1 FROM user_books WHERE user_id = ? AND book_id = ?',
+        (owner_user_id, book_id)
+    ).fetchone()
+    if not source_book_exists:
+        return False
+
+    now = time.time()
+    db.execute(
+        '''
+        INSERT OR IGNORE INTO user_books (
+            user_id, book_id, title, author, epub_key, epub_url, cover_key, cover_url,
+            total_chapters, total_sentences, chapter_index, sentence_index, sentence_id,
+            reading_percentage, ready_audio_count, audio_percentage, created_at, updated_at, last_opened
+        )
+        SELECT
+            ?,
+            book_id,
+            title,
+            author,
+            epub_key,
+            epub_url,
+            cover_key,
+            cover_url,
+            total_chapters,
+            total_sentences,
+            0,
+            0,
+            NULL,
+            0,
+            ready_audio_count,
+            audio_percentage,
+            ?,
+            ?,
+            ?
+        FROM user_books
+        WHERE user_id = ? AND book_id = ?
+        ''',
+        (member_user_id, now, now, now, owner_user_id, book_id)
+    )
+
+    db.execute(
+        '''
+        INSERT INTO book_audio (
+            user_id, book_id, sentence_id, sentence_index, hash, text,
+            status, s3_key, s3_url, audio_format, error,
+            created_at, updated_at, completed_at
+        )
+        SELECT
+            ?,
+            book_id,
+            sentence_id,
+            sentence_index,
+            hash,
+            text,
+            status,
+            s3_key,
+            s3_url,
+            audio_format,
+            error,
+            ?,
+            ?,
+            completed_at
+        FROM book_audio
+        WHERE user_id = ? AND book_id = ?
+        ON CONFLICT(user_id, book_id, sentence_id) DO UPDATE SET
+            sentence_index = excluded.sentence_index,
+            hash = excluded.hash,
+            text = excluded.text,
+            status = CASE
+                WHEN excluded.status = 'ready' THEN 'ready'
+                WHEN book_audio.status = 'ready' THEN 'ready'
+                ELSE book_audio.status
+            END,
+            s3_key = CASE
+                WHEN excluded.status = 'ready' THEN excluded.s3_key
+                ELSE COALESCE(book_audio.s3_key, excluded.s3_key)
+            END,
+            s3_url = CASE
+                WHEN excluded.status = 'ready' THEN excluded.s3_url
+                ELSE COALESCE(book_audio.s3_url, excluded.s3_url)
+            END,
+            audio_format = CASE
+                WHEN excluded.status = 'ready' THEN excluded.audio_format
+                ELSE COALESCE(book_audio.audio_format, excluded.audio_format)
+            END,
+            error = CASE
+                WHEN excluded.status = 'ready' THEN NULL
+                ELSE COALESCE(book_audio.error, excluded.error)
+            END,
+            updated_at = excluded.updated_at,
+            completed_at = CASE
+                WHEN excluded.status = 'ready' THEN excluded.completed_at
+                ELSE COALESCE(book_audio.completed_at, excluded.completed_at)
+            END
+        ''',
+        (member_user_id, now, now, owner_user_id, book_id)
+    )
+    refresh_user_book_audio_progress(db, member_user_id, book_id)
+    return True
+
+
+def provision_shared_books_to_member(db, club_id, owner_user_id, member_user_id):
+    shared_book_ids = list_club_shared_book_ids(db, club_id)
+    for shared_book_id in shared_book_ids:
+        provision_book_from_owner_to_member(
+            db=db,
+            owner_user_id=owner_user_id,
+            member_user_id=member_user_id,
+            book_id=shared_book_id
+        )
+    return shared_book_ids
+
+
+def provision_shared_book_to_all_members(db, club_id, owner_user_id, book_id):
+    member_rows = db.execute(
+        'SELECT user_id FROM club_members WHERE club_id = ?',
+        (club_id,)
+    ).fetchall()
+    for member in member_rows:
+        member_user_id = str(member['user_id'] or '').strip()
+        if not member_user_id or member_user_id == owner_user_id:
+            continue
+        provision_book_from_owner_to_member(
+            db=db,
+            owner_user_id=owner_user_id,
+            member_user_id=member_user_id,
+            book_id=book_id
+        )
+
+
 def serialize_club_row(db, row, include_members=True):
     members = []
     if include_members:
@@ -928,6 +1187,8 @@ def serialize_club_row(db, row, include_members=True):
     if plan is not None and not isinstance(plan, dict):
         plan = None
 
+    shared_book_ids = list_club_shared_book_ids(db, row['id'])
+
     return {
         'id': row['id'],
         'name': row['name'],
@@ -938,6 +1199,7 @@ def serialize_club_row(db, row, include_members=True):
         'joinPolicy': row['join_policy'] if row['join_policy'] in ('link', 'approval') else 'link',
         'members': members,
         'activeBookId': row['active_book_id'],
+        'sharedBookIds': shared_book_ids,
         'plan': plan,
         'pinnedPostId': row['pinned_post_id'],
     }
@@ -2746,7 +3008,7 @@ def translate_text():
     )
 
     try:
-        result = translate_with_openai(text, target_language, source_language)
+        result = translate_with_bedrock(text, target_language, source_language)
         return jsonify({
             'translated_text': result.get('translated_text', ''),
             'target_language': result.get('target_language', target_language),
@@ -2838,10 +3100,11 @@ def send_book_chat_message(book_id):
     db.commit()
 
     try:
-        assistant_reply, used_model = openai_chat_completion(
+        assistant_reply, used_model = bedrock_chat_completion(
             messages=model_messages,
-            model=OPENAI_CHAT_MODEL,
+            model=BEDROCK_MODEL_ID,
             temperature=0.4,
+            max_tokens=1800,
         )
     except RuntimeError as e:
         message_text = str(e)
@@ -2851,8 +3114,8 @@ def send_book_chat_message(book_id):
         return jsonify({'error': f'AI request failed: {str(e)}'}), 500
 
     cleaned_reply = (assistant_reply or '').strip()
-    if len(cleaned_reply) > OPENAI_MAX_REPLY_CHARS:
-        cleaned_reply = cleaned_reply[:OPENAI_MAX_REPLY_CHARS].rstrip()
+    if len(cleaned_reply) > AI_MAX_REPLY_CHARS:
+        cleaned_reply = cleaned_reply[:AI_MAX_REPLY_CHARS].rstrip()
 
     db.execute(
         '''
@@ -3339,6 +3602,12 @@ def join_club():
         ''',
         (row['id'], profile['user_id'], profile['display_name'], profile['avatar_color'], now, json.dumps(_default_member_notifications()))
     )
+    provision_shared_books_to_member(
+        db=db,
+        club_id=row['id'],
+        owner_user_id=row['owner_user_id'],
+        member_user_id=profile['user_id']
+    )
     db.execute('UPDATE clubs SET updated_at = ? WHERE id = ?', (now, row['id']))
     db.commit()
     refreshed = db.execute('SELECT * FROM clubs WHERE id = ?', (row['id'],)).fetchone()
@@ -3411,6 +3680,25 @@ def update_club(club_id):
         ''',
         (name, description, join_policy, active_book_id, json.dumps(plan) if plan is not None else None, pinned_post_id, now, club_id)
     )
+    if active_book_id:
+        owner_has_active = db.execute(
+            'SELECT 1 FROM user_books WHERE user_id = ? AND book_id = ?',
+            (user_id, active_book_id)
+        ).fetchone()
+        if owner_has_active:
+            db.execute(
+                '''
+                INSERT OR IGNORE INTO club_shared_books (club_id, book_id, added_by_user_id, created_at)
+                VALUES (?, ?, ?, ?)
+                ''',
+                (club_id, active_book_id, user_id, now)
+            )
+            provision_shared_book_to_all_members(
+                db=db,
+                club_id=club_id,
+                owner_user_id=user_id,
+                book_id=active_book_id
+            )
     db.commit()
 
     refreshed = db.execute('SELECT * FROM clubs WHERE id = ?', (club_id,)).fetchone()
@@ -3429,6 +3717,7 @@ def delete_club(club_id):
     db.execute('DELETE FROM club_thread_messages WHERE thread_id IN (SELECT id FROM club_threads WHERE club_id = ?)', (club_id,))
     db.execute('DELETE FROM club_threads WHERE club_id = ?', (club_id,))
     db.execute('DELETE FROM club_posts WHERE club_id = ?', (club_id,))
+    db.execute('DELETE FROM club_shared_books WHERE club_id = ?', (club_id,))
     db.execute('DELETE FROM club_members WHERE club_id = ?', (club_id,))
     db.execute('DELETE FROM club_join_requests WHERE club_id = ?', (club_id,))
     db.execute('DELETE FROM club_spoiler_preferences WHERE club_id = ?', (club_id,))
@@ -3450,6 +3739,7 @@ def leave_club(club_id):
         db.execute('DELETE FROM club_thread_messages WHERE thread_id IN (SELECT id FROM club_threads WHERE club_id = ?)', (club_id,))
         db.execute('DELETE FROM club_threads WHERE club_id = ?', (club_id,))
         db.execute('DELETE FROM club_posts WHERE club_id = ?', (club_id,))
+        db.execute('DELETE FROM club_shared_books WHERE club_id = ?', (club_id,))
         db.execute('DELETE FROM club_members WHERE club_id = ?', (club_id,))
         db.execute('DELETE FROM club_join_requests WHERE club_id = ?', (club_id,))
         db.execute('DELETE FROM club_spoiler_preferences WHERE club_id = ?', (club_id,))
@@ -3527,6 +3817,94 @@ def remove_club_member(club_id, member_user_id):
     db.execute('UPDATE clubs SET updated_at = ? WHERE id = ?', (time.time(), club_id))
     db.commit()
     return jsonify({'status': 'ok', 'clubId': club_id, 'userId': member_user_id})
+
+
+@app.route('/clubs/<club_id>/shared_books', methods=['POST'])
+@require_auth
+def add_club_shared_book(club_id):
+    db = get_db()
+    user_id = get_current_user_id()
+    row, error_response = ensure_owner_access(db, club_id, user_id)
+    if error_response:
+        return error_response
+
+    data = request.json or {}
+    book_id = normalize_book_id(data.get('bookId') or data.get('book_id'))
+    if not book_id:
+        return jsonify({'error': 'Missing bookId'}), 400
+
+    owner_has_book = db.execute(
+        'SELECT 1 FROM user_books WHERE user_id = ? AND book_id = ?',
+        (user_id, book_id)
+    ).fetchone()
+    if not owner_has_book:
+        return jsonify({'error': 'Book not found in owner library'}), 404
+
+    now = time.time()
+    db.execute(
+        '''
+        INSERT OR IGNORE INTO club_shared_books (club_id, book_id, added_by_user_id, created_at)
+        VALUES (?, ?, ?, ?)
+        ''',
+        (club_id, book_id, user_id, now)
+    )
+    active_book_id = str(row['active_book_id'] or '').strip()
+    if not active_book_id:
+        db.execute('UPDATE clubs SET active_book_id = ?, updated_at = ? WHERE id = ?', (book_id, now, club_id))
+    else:
+        db.execute('UPDATE clubs SET updated_at = ? WHERE id = ?', (now, club_id))
+
+    provision_shared_book_to_all_members(
+        db=db,
+        club_id=club_id,
+        owner_user_id=user_id,
+        book_id=book_id
+    )
+    db.commit()
+
+    refreshed = db.execute('SELECT * FROM clubs WHERE id = ?', (club_id,)).fetchone()
+    return jsonify({'club': serialize_club_row(db, refreshed, include_members=True)})
+
+
+@app.route('/clubs/<club_id>/shared_books/<book_id>', methods=['DELETE'])
+@require_auth
+def remove_club_shared_book(club_id, book_id):
+    db = get_db()
+    user_id = get_current_user_id()
+    row, error_response = ensure_owner_access(db, club_id, user_id)
+    if error_response:
+        return error_response
+
+    normalized_book_id = normalize_book_id(book_id)
+    if not normalized_book_id:
+        return jsonify({'error': 'Invalid bookId'}), 400
+
+    now = time.time()
+    db.execute(
+        'DELETE FROM club_shared_books WHERE club_id = ? AND book_id = ?',
+        (club_id, normalized_book_id)
+    )
+
+    active_book_id = str(row['active_book_id'] or '').strip()
+    if active_book_id == normalized_book_id:
+        fallback = db.execute(
+            '''
+            SELECT book_id
+            FROM club_shared_books
+            WHERE club_id = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            ''',
+            (club_id,)
+        ).fetchone()
+        next_active = str(fallback['book_id']).strip() if fallback and fallback['book_id'] else None
+        db.execute('UPDATE clubs SET active_book_id = ?, updated_at = ? WHERE id = ?', (next_active, now, club_id))
+    else:
+        db.execute('UPDATE clubs SET updated_at = ? WHERE id = ?', (now, club_id))
+
+    db.commit()
+    refreshed = db.execute('SELECT * FROM clubs WHERE id = ?', (club_id,)).fetchone()
+    return jsonify({'club': serialize_club_row(db, refreshed, include_members=True)})
 
 
 @app.route('/clubs/<club_id>/members/me/progress', methods=['POST'])
